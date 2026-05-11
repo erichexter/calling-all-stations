@@ -20,6 +20,8 @@ import {
   getTask,
   pruneExpiredTasks,
   handleA2aRequest,
+  validateA2aVersion,
+  SUPPORTED_A2A_VERSIONS,
 } from '../server.js'
 
 // Reset state between tests
@@ -181,6 +183,16 @@ describe('Task management', () => {
     assert.ok(tasks.has(task.id))
   })
 
+  test('createTask assigns a contextId by default', () => {
+    const task = createTask('sess-1', {})
+    assert.ok(task.contextId, 'should have contextId')
+  })
+
+  test('createTask accepts explicit contextId', () => {
+    const task = createTask('sess-1', {}, 'ctx-123')
+    assert.equal(task.contextId, 'ctx-123')
+  })
+
   test('updateTask updates fields', () => {
     const task = createTask('sess-1', {})
     updateTask(task.id, { status: { state: 'completed' }, result: { answer: 42 } })
@@ -205,6 +217,28 @@ describe('Task management', () => {
     const task = createTask('s', {})
     pruneExpiredTasks()
     assert.ok(getTask(task.id))
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('validateA2aVersion', () => {
+  test('returns null for null header (missing = tolerated)', () => {
+    assert.equal(validateA2aVersion(null), null)
+  })
+
+  test('returns null for supported version', () => {
+    assert.equal(validateA2aVersion('1.0'), null)
+  })
+
+  test('returns error for unsupported version', () => {
+    const err = validateA2aVersion('99.0')
+    assert.ok(err)
+    assert.equal(err.error.code, -32003)
+    assert.ok(err.error.message.includes('99.0'))
+  })
+
+  test('SUPPORTED_A2A_VERSIONS includes 1.0', () => {
+    assert.ok(SUPPORTED_A2A_VERSIONS.includes('1.0'))
   })
 })
 
@@ -291,5 +325,98 @@ describe('handleA2aRequest', () => {
   test('message/send without message param returns error', () => {
     const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'message/send', params: {} }, null, 'http://test.local')
     assert.equal(res.error.code, -32602)
+  })
+
+  // Spec-compliant method name aliases
+  test('sendMessage is accepted as alias for message/send', () => {
+    registry.set('sess-z', { session_id: 'sess-z', label: 'Z', status: 'running', current_step: 'idle', skills: [] })
+    inboxes.set('sess-z', [])
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'sendMessage', params: { message: { role: 'user', parts: [{ text: 'hi' }] } } },
+      'sess-z',
+      'http://test.local'
+    )
+    assert.ok(!res.error)
+    assert.equal(res.result.task.status.state, 'working')
+  })
+
+  test('getTask is accepted as alias for tasks/get', () => {
+    const task = createTask('s', {})
+    const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'getTask', params: { taskId: task.id } }, null, 'http://test.local')
+    assert.equal(res.result.task.id, task.id)
+  })
+
+  test('cancelTask cancels a working task', () => {
+    const task = createTask('s', {})
+    updateTask(task.id, { status: { state: 'working' } })
+    const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'cancelTask', params: { taskId: task.id } }, null, 'http://test.local')
+    assert.ok(!res.error)
+    assert.equal(res.result.task.status.state, 'canceled')
+  })
+
+  test('cancelTask returns error for unknown task', () => {
+    const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'cancelTask', params: { taskId: 'no-such' } }, null, 'http://test.local')
+    assert.equal(res.error.code, -32001)
+  })
+
+  test('cancelTask returns error when task already completed', () => {
+    const task = createTask('s', {})
+    updateTask(task.id, { status: { state: 'completed' } })
+    const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'cancelTask', params: { taskId: task.id } }, null, 'http://test.local')
+    assert.equal(res.error.code, -32002)
+  })
+
+  test('listTasks returns all tasks', () => {
+    createTask('s1', {})
+    createTask('s2', {})
+    const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'listTasks', params: {} }, null, 'http://test.local')
+    assert.ok(!res.error)
+    assert.equal(res.result.tasks.length, 2)
+  })
+
+  test('listTasks filters by contextId', () => {
+    createTask('s1', {}, 'ctx-A')
+    createTask('s2', {}, 'ctx-B')
+    const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'listTasks', params: { contextId: 'ctx-A' } }, null, 'http://test.local')
+    assert.equal(res.result.tasks.length, 1)
+    assert.equal(res.result.tasks[0].contextId, 'ctx-A')
+  })
+
+  test('listTasks filters by status', () => {
+    const t1 = createTask('s1', {})
+    updateTask(t1.id, { status: { state: 'completed' } })
+    createTask('s2', {}) // stays submitted
+    const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'listTasks', params: { status: 'completed' } }, null, 'http://test.local')
+    assert.equal(res.result.tasks.length, 1)
+    assert.equal(res.result.tasks[0].status.state, 'completed')
+  })
+
+  test('A2A-Version unsupported returns error', () => {
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'listTasks', params: {} },
+      null, 'http://test.local',
+      { a2aVersion: '99.0' }
+    )
+    assert.equal(res.error.code, -32003)
+  })
+
+  test('A2A-Version 1.0 is accepted', () => {
+    createTask('s', {})
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'listTasks', params: {} },
+      null, 'http://test.local',
+      { a2aVersion: '1.0' }
+    )
+    assert.ok(!res.error)
+  })
+
+  test('contextId is passed through on sendMessage to agent', () => {
+    registry.set('sess-ctx', { session_id: 'sess-ctx', label: 'C', status: 'running', current_step: 'idle', skills: [] })
+    inboxes.set('sess-ctx', [])
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'sendMessage', params: { contextId: 'ctx-42', message: { parts: [{ text: 'hi' }] } } },
+      'sess-ctx', 'http://test.local'
+    )
+    assert.equal(res.result.task.contextId, 'ctx-42')
   })
 })

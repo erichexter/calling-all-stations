@@ -431,6 +431,110 @@ describe('POST /a2a message/stream — SSE streaming', () => {
 })
 
 // ---------------------------------------------------------------------------
+describe('A2A spec-compliant method names', () => {
+  test('sendMessage is accepted (spec name)', async () => {
+    await post(`${base}/register`, { session_id: 'spec-1', label: 'Spec Agent' })
+    const { json } = await post(`${base}/agents/spec-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { message: { role: 'user', parts: [{ text: 'hello' }] } },
+    })
+    assert.ok(!json.error)
+    assert.equal(json.result.task.status.state, 'working')
+  })
+
+  test('getTask is accepted (spec name)', async () => {
+    await post(`${base}/register`, { session_id: 'spec-2', label: 'Spec2' })
+    const send = await post(`${base}/agents/spec-2/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { message: { parts: [{ text: 'x' }] } },
+    })
+    const taskId = send.json.result.task.id
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'getTask', params: { taskId },
+    })
+    assert.ok(!json.error)
+    assert.equal(json.result.task.id, taskId)
+  })
+
+  test('sendStreamingMessage is accepted (spec name for SSE)', async () => {
+    const res = await fetch(`${base}/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 10,
+        method: 'sendStreamingMessage',
+        params: { message: { role: 'user', parts: [{ text: 'stream' }] } },
+      }),
+    })
+    assert.equal(res.status, 200)
+    assert.ok(res.headers.get('content-type').includes('text/event-stream'))
+    const text = await res.text()
+    assert.ok(text.includes('working'))
+    assert.ok(text.includes('completed'))
+  })
+
+  test('cancelTask via JSON-RPC', async () => {
+    await post(`${base}/register`, { session_id: 'cancel-1', label: 'Cancel Target' })
+    const send = await post(`${base}/agents/cancel-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { message: { parts: [{ text: 'work' }] } },
+    })
+    const taskId = send.json.result.task.id
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'cancelTask', params: { taskId },
+    })
+    assert.ok(!json.error)
+    assert.equal(json.result.task.status.state, 'canceled')
+  })
+
+  test('listTasks returns all tasks', async () => {
+    await post(`${base}/register`, { session_id: 'list-1', label: 'List Agent' })
+    await post(`${base}/agents/list-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { message: { parts: [{ text: 'task 1' }] } },
+    })
+    await post(`${base}/agents/list-1/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'sendMessage',
+      params: { message: { parts: [{ text: 'task 2' }] } },
+    })
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 3, method: 'listTasks', params: {},
+    })
+    assert.ok(!json.error)
+    assert.ok(json.result.tasks.length >= 2)
+  })
+
+  test('contextId is preserved through task creation', async () => {
+    await post(`${base}/register`, { session_id: 'ctx-1', label: 'Context Agent' })
+    const { json } = await post(`${base}/agents/ctx-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { contextId: 'my-ctx-id', message: { parts: [{ text: 'hello' }] } },
+    })
+    assert.ok(!json.error)
+    assert.equal(json.result.task.contextId, 'my-ctx-id')
+  })
+
+  test('A2A-Version header is returned on all A2A responses', async () => {
+    const res = await fetch(`${base}/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'a2a-version': '1.0' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'listTasks', params: {} }),
+    })
+    assert.equal(res.headers.get('a2a-version'), '1.0')
+  })
+
+  test('unsupported A2A-Version returns -32003', async () => {
+    const res = await fetch(`${base}/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'a2a-version': '99.0' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'listTasks', params: {} }),
+    })
+    const json = await res.json()
+    assert.equal(json.error.code, -32003)
+  })
+})
+
+// ---------------------------------------------------------------------------
 describe('Existing REST endpoints still work', () => {
   test('POST /register → POST /check-inbox → POST /send-directive round-trip', async () => {
     await post(`${base}/register`, { session_id: 'rest-1', label: 'REST Agent' })

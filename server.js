@@ -228,10 +228,11 @@ export function buildSkillDirectory() {
 
 const TASK_TTL_MS = 60 * 60 * 1000 // 1 hour
 
-export function createTask(sessionId, message) {
+export function createTask(sessionId, message, contextId = null) {
   const id = crypto.randomUUID()
   const task = {
     id,
+    contextId: contextId ?? crypto.randomUUID(),
     session_id: sessionId,
     status: { state: 'submitted' },
     message,
@@ -268,14 +269,29 @@ export function pruneExpiredTasks() {
 
 let seq = 0
 
-export function handleA2aRequest(payload, sessionId, baseUrl) {
+export const SUPPORTED_A2A_VERSIONS = ['1.0']
+
+export function validateA2aVersion(versionHeader) {
+  if (!versionHeader) return null // missing — warn but allow for now
+  if (!SUPPORTED_A2A_VERSIONS.includes(versionHeader)) {
+    return { jsonrpc: '2.0', id: null, error: { code: -32003, message: `Unsupported A2A-Version: ${versionHeader}. Supported: ${SUPPORTED_A2A_VERSIONS.join(', ')}` } }
+  }
+  return null
+}
+
+export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
   const { jsonrpc, id, method, params } = payload
+  const { a2aVersion } = options
+
+  const versionError = a2aVersion !== undefined ? validateA2aVersion(a2aVersion) : null
+  if (versionError) return { ...versionError, id: id ?? null }
 
   if (jsonrpc !== '2.0') {
     return { jsonrpc: '2.0', id: id ?? null, error: { code: -32600, message: 'Invalid Request' } }
   }
 
-  if (method === 'tasks/get') {
+  // A2A spec method names (kept alongside legacy aliases for backward compat)
+  if (method === 'tasks/get' || method === 'getTask') {
     const taskId = params?.taskId ?? params?.id
     if (!taskId) {
       return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing taskId' } }
@@ -287,7 +303,34 @@ export function handleA2aRequest(payload, sessionId, baseUrl) {
     return { jsonrpc: '2.0', id, result: { task } }
   }
 
-  if (method === 'message/send') {
+  if (method === 'cancelTask') {
+    const taskId = params?.taskId ?? params?.id
+    if (!taskId) {
+      return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing taskId' } }
+    }
+    const task = getTask(taskId)
+    if (!task) {
+      return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Task not found' } }
+    }
+    const terminal = ['completed', 'failed', 'canceled', 'rejected']
+    if (terminal.includes(task.status.state)) {
+      return { jsonrpc: '2.0', id, error: { code: -32002, message: `Task already in terminal state: ${task.status.state}` } }
+    }
+    updateTask(taskId, { status: { state: 'canceled' } })
+    process.stderr.write(`[switchboard] A2A task ${taskId.slice(0,8)} canceled\n`)
+    return { jsonrpc: '2.0', id, result: { task: getTask(taskId) } }
+  }
+
+  if (method === 'listTasks') {
+    const { contextId, status: statusFilter, limit = 100, offset = 0 } = params ?? {}
+    let results = Array.from(tasks.values())
+    if (contextId) results = results.filter(t => t.contextId === contextId)
+    if (statusFilter) results = results.filter(t => t.status.state === statusFilter)
+    const page = results.slice(offset, offset + limit)
+    return { jsonrpc: '2.0', id, result: { tasks: page, total: results.length, offset, limit } }
+  }
+
+  if (method === 'message/send' || method === 'sendMessage') {
     const message = params?.message
     if (!message) {
       return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing message' } }
@@ -298,7 +341,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl) {
       if (!registry.has(sessionId)) {
         return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Agent not found' } }
       }
-      const task = createTask(sessionId, message)
+      const task = createTask(sessionId, message, params?.contextId ?? null)
       const directive = {
         id: crypto.randomUUID(),
         type: 'a2a_message',
@@ -328,7 +371,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl) {
       if (!target) {
         return { jsonrpc: '2.0', id, error: { code: -32001, message: `No running agent with skill: ${skill}` } }
       }
-      const task = createTask(target.session_id, message)
+      const task = createTask(target.session_id, message, params?.contextId ?? null)
       const directive = {
         id: crypto.randomUUID(),
         type: 'a2a_message',
@@ -434,25 +477,28 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       },
       {
         name: 'complete_task',
-        description: 'Complete an A2A task that was routed to you via check_inbox (type: a2a_message). Call this when you have finished processing the task.',
+        description: 'Complete or fail an A2A task that was routed to you via check_inbox (type: a2a_message). Call this when you have finished processing the task.',
         inputSchema: {
           type: 'object',
           properties: {
             task_id:   { type: 'string', description: 'The task_id from the a2a_message directive body' },
-            result:    { type: 'object', description: 'Task result payload' },
+            result:    { type: 'object', description: 'Task result payload (omit or null to indicate failure)' },
+            error:     { type: 'object', description: 'Error details if the task failed. Sets state to "failed".' },
             artifacts: {
               type: 'array',
-              description: 'Optional output artifacts',
+              description: 'Optional output artifacts (A2A spec: { artifactId, name, description, parts[] })',
               items: {
                 type: 'object',
                 properties: {
-                  mimeType: { type: 'string' },
-                  data:     {},
+                  artifactId:  { type: 'string' },
+                  name:        { type: 'string' },
+                  description: { type: 'string' },
+                  parts:       { type: 'array' },
                 },
               },
             },
           },
-          required: ['task_id', 'result'],
+          required: ['task_id'],
         },
       },
     ],
@@ -517,19 +563,23 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
     }
 
     if (name === 'complete_task') {
-      const { task_id, result, artifacts = [] } = args
+      const { task_id, result, error: taskError, artifacts = [] } = args
       const task = getTask(task_id)
       if (!task) {
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'task_not_found' }) }] }
       }
-      updateTask(task_id, { status: { state: 'completed' }, result, artifacts })
-      process.stderr.write(`[switchboard] task completed: ${task_id.slice(0,8)}\n`)
-      // Broadcast task completion
-      broadcastNotification('notifications/message', {
-        content: `Task ${task_id.slice(0,8)} completed`,
-        meta: { message_id: `m${Date.now()}`, ts: new Date().toISOString(), event: 'agent_response', task_id, result },
+      const newState = taskError ? 'failed' : 'completed'
+      updateTask(task_id, {
+        status: taskError ? { state: 'failed', error: taskError } : { state: 'completed' },
+        result: result ?? null,
+        artifacts,
       })
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, task_id }) }] }
+      process.stderr.write(`[switchboard] task ${newState}: ${task_id.slice(0,8)}\n`)
+      broadcastNotification('notifications/message', {
+        content: `Task ${task_id.slice(0,8)} ${newState}`,
+        meta: { message_id: `m${Date.now()}`, ts: new Date().toISOString(), event: 'agent_response', task_id, result, state: newState },
+      })
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, task_id, state: newState }) }] }
     }
 
     return { content: [{ type: 'text', text: JSON.stringify({ error: 'unknown tool' }) }], isError: true }
@@ -617,8 +667,8 @@ export function createAppServer() {
           return
         }
 
-        // message/stream — SSE streaming response
-        if (payload.method === 'message/stream') {
+        // sendStreamingMessage / message/stream — SSE streaming response
+        if (payload.method === 'message/stream' || payload.method === 'sendStreamingMessage') {
           const { id, params } = payload
           const message = params?.message
           if (!message) {
@@ -663,8 +713,8 @@ export function createAppServer() {
           return
         }
 
-        const result = handleA2aRequest(payload, null, getServerUrl())
-        res.writeHead(200, { 'content-type': 'application/json' })
+        const result = handleA2aRequest(payload, null, getServerUrl(), { a2aVersion: req.headers['a2a-version'] })
+        res.writeHead(200, { 'content-type': 'application/json', 'a2a-version': '1.0' })
         res.end(JSON.stringify(result))
         return
       }
@@ -682,12 +732,12 @@ export function createAppServer() {
         await new Promise(r => req.on('end', r))
         let payload
         try { payload = JSON.parse(body) } catch {
-          res.writeHead(200, { 'content-type': 'application/json' })
+          res.writeHead(200, { 'content-type': 'application/json', 'a2a-version': '1.0' })
           res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }))
           return
         }
-        const result = handleA2aRequest(payload, session_id, getServerUrl())
-        res.writeHead(200, { 'content-type': 'application/json' })
+        const result = handleA2aRequest(payload, session_id, getServerUrl(), { a2aVersion: req.headers['a2a-version'] })
+        res.writeHead(200, { 'content-type': 'application/json', 'a2a-version': '1.0' })
         res.end(JSON.stringify(result))
         return
       }
