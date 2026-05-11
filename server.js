@@ -357,6 +357,8 @@ export function updateTask(taskId, patch) {
     patch = { ...patch, artifacts: patch.artifacts.map(normalizeArtifact).filter(Boolean) }
   }
   Object.assign(task, patch, { updated_at: new Date().toISOString() })
+  // Push to any SSE subscribers watching this task
+  notifyTaskSubscribers(taskId)
   return task
 }
 
@@ -368,6 +370,31 @@ export function pruneExpiredTasks() {
   const cutoff = Date.now() - TASK_TTL_MS
   for (const [id, task] of tasks) {
     if (new Date(task.created_at).getTime() < cutoff) tasks.delete(id)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Task subscription — per-task SSE push (subscribeToTask)
+// ---------------------------------------------------------------------------
+
+// taskId → Set of { res, id } (one per subscriber)
+export const taskSubscribers = new Map()
+
+export function notifyTaskSubscribers(taskId) {
+  const subs = taskSubscribers.get(taskId)
+  if (!subs || subs.size === 0) return
+  const task = getTask(taskId)
+  if (!task) return
+  const event = JSON.stringify({ jsonrpc: '2.0', id: null, result: { task } })
+  for (const sub of subs) {
+    try { sub.res.write(`data: ${event}\n\n`) } catch {}
+  }
+  // If task reached terminal state, close all subscriber streams
+  if (TERMINAL_STATES.has(task.status.state)) {
+    for (const sub of subs) {
+      try { sub.res.end() } catch {}
+    }
+    taskSubscribers.delete(taskId)
   }
 }
 
@@ -435,6 +462,20 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
     if (statusFilter) results = results.filter(t => t.status.state === statusFilter)
     const page = results.slice(offset, offset + limit)
     return { jsonrpc: '2.0', id, result: { tasks: page, total: results.length, offset, limit } }
+  }
+
+  if (method === 'subscribeToTask') {
+    // subscribeToTask is SSE-based — cannot be handled in the pure JSON-RPC function.
+    // Return a sentinel so the HTTP layer can set up the SSE stream.
+    const taskId = params?.taskId ?? params?.id
+    if (!taskId) {
+      return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing taskId' } }
+    }
+    const task = getTask(taskId)
+    if (!task) {
+      return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Task not found' } }
+    }
+    return { jsonrpc: '2.0', id, result: { task }, _subscribe: taskId }
   }
 
   if (method === 'rejectTask') {
@@ -892,6 +933,28 @@ export function createAppServer() {
         }
 
         const result = handleA2aRequest(payload, null, getServerUrl(), { a2aVersion: req.headers['a2a-version'] })
+
+        // subscribeToTask: upgrade to SSE and stream task updates
+        if (result._subscribe) {
+          const taskId = result._subscribe
+          delete result._subscribe
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+            'a2a-version': '1.0',
+          })
+          // Send current task state immediately
+          res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', id: result.id, result: result.result })}\n\n`)
+          const sub = { res, id: result.id }
+          if (!taskSubscribers.has(taskId)) taskSubscribers.set(taskId, new Set())
+          taskSubscribers.get(taskId).add(sub)
+          req.on('close', () => {
+            taskSubscribers.get(taskId)?.delete(sub)
+          })
+          return
+        }
+
         res.writeHead(200, { 'content-type': 'application/json', 'a2a-version': '1.0' })
         res.end(JSON.stringify(result))
         return
@@ -914,6 +977,48 @@ export function createAppServer() {
           res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }))
           return
         }
+
+        // sendStreamingMessage on per-agent endpoint — SSE stream routed to specific agent
+        if (payload.method === 'message/stream' || payload.method === 'sendStreamingMessage') {
+          const { id, params } = payload
+          const message = params?.message
+          if (!message) {
+            res.writeHead(200, { 'content-type': 'application/json', 'a2a-version': '1.0' })
+            res.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing message' } }))
+            return
+          }
+          if (!registry.has(session_id)) {
+            res.writeHead(200, { 'content-type': 'application/json', 'a2a-version': '1.0' })
+            res.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32001, message: 'Agent not found' } }))
+            return
+          }
+          // Create the task and route directive as normal, then stream updates
+          const task = createTask(session_id, message, params?.contextId ?? null)
+          const directive = {
+            id: crypto.randomUUID(), type: 'a2a_message',
+            body: { task_id: task.id, message, returnImmediately: params?.returnImmediately !== false },
+            sent_at: new Date().toISOString(), delivered: false,
+          }
+          if (!inboxes.has(session_id)) inboxes.set(session_id, [])
+          inboxes.get(session_id).push(directive)
+          updateTask(task.id, { status: { state: 'working' } })
+          persistState()
+
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+            'a2a-version': '1.0',
+          })
+          res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', id, result: { task: getTask(task.id) } })}\n\n`)
+          const sub = { res, id }
+          if (!taskSubscribers.has(task.id)) taskSubscribers.set(task.id, new Set())
+          taskSubscribers.get(task.id).add(sub)
+          req.on('close', () => { taskSubscribers.get(task.id)?.delete(sub) })
+          process.stderr.write(`[switchboard] A2A per-agent stream task ${task.id.slice(0,8)} → ${session_id.slice(0,8)}\n`)
+          return
+        }
+
         const result = handleA2aRequest(payload, session_id, getServerUrl(), { a2aVersion: req.headers['a2a-version'] })
         res.writeHead(200, { 'content-type': 'application/json', 'a2a-version': '1.0' })
         res.end(JSON.stringify(result))

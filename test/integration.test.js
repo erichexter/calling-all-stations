@@ -535,6 +535,147 @@ describe('A2A spec-compliant method names', () => {
 })
 
 // ---------------------------------------------------------------------------
+/** Read a bounded number of SSE events from a ReadableStreamDefaultReader. */
+async function readSseEvents(reader, count = 2, timeoutMs = 1000) {
+  const events = []
+  const decoder = new TextDecoder()
+  let buf = ''
+  const deadline = Date.now() + timeoutMs
+  try {
+    while (events.length < count && Date.now() < deadline) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('sse timeout')), remaining)),
+      ])
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const chunks = buf.split('\n\n')
+      buf = chunks.pop()
+      for (const chunk of chunks) {
+        const line = chunk.split('\n').find(l => l.startsWith('data:'))
+        if (line) {
+          try { events.push(JSON.parse(line.slice(5))) } catch {}
+        }
+      }
+    }
+  } catch {}
+  return events
+}
+
+describe('subscribeToTask — per-task SSE', () => {
+  test('subscribeToTask returns SSE stream and closes on task completion', async () => {
+    await post(`${base}/register`, { session_id: 'sub-1', label: 'Sub Agent' })
+    const send = await post(`${base}/agents/sub-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { message: { parts: [{ kind: 'text', text: 'do stuff' }] } },
+    })
+    const taskId = send.json.result.task.id
+
+    // Subscribe: get current state + completion event
+    const res = await fetch(`${base}/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'a2a-version': '1.0' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'subscribeToTask', params: { taskId } }),
+    })
+    assert.equal(res.status, 200)
+    assert.ok(res.headers.get('content-type').includes('text/event-stream'))
+
+    // Complete the task while reading — stream should get the update then close
+    setTimeout(() => post(`${base}/send`, {
+      event: 'agent_response', session_id: 'sub-1', task_id: taskId, result: { done: true },
+    }), 30)
+
+    const reader = res.body.getReader()
+    const events = await readSseEvents(reader, 2, 500)
+    assert.ok(events.length >= 1, `Expected ≥1 SSE event, got ${events.length}`)
+    assert.equal(events[0].id, 5)
+    assert.ok(events[0].result?.task?.id === taskId)
+  })
+
+  test('subscribeToTask returns error for unknown task', async () => {
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'subscribeToTask', params: { taskId: 'no-such' },
+    })
+    assert.equal(json.error.code, -32001)
+  })
+
+  test('subscribeToTask returns error when taskId missing', async () => {
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'subscribeToTask', params: {},
+    })
+    assert.equal(json.error.code, -32602)
+  })
+})
+
+describe('per-agent sendStreamingMessage SSE', () => {
+  test('sendStreamingMessage on /agents/:id/a2a returns SSE stream with working state', async () => {
+    await post(`${base}/register`, { session_id: 'stream-1', label: 'Stream Agent' })
+    const res = await fetch(`${base}/agents/stream-1/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'a2a-version': '1.0' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 7, method: 'sendStreamingMessage',
+        params: { message: { role: 'user', parts: [{ kind: 'text', text: 'stream this' }] } },
+      }),
+    })
+    assert.equal(res.status, 200)
+    assert.ok(res.headers.get('content-type').includes('text/event-stream'))
+
+    const reader = res.body.getReader()
+    const events = await readSseEvents(reader, 1, 500)
+    assert.ok(events.length >= 1, `Expected ≥1 SSE event, got ${events.length}`)
+    assert.equal(events[0].id, 7)
+    assert.equal(events[0].result?.task?.status?.state, 'working')
+    // Verify directive landed in agent inbox
+    const inbox = inboxes.get('stream-1') ?? []
+    assert.ok(inbox.some(d => d.type === 'a2a_message'))
+    reader.cancel()
+  })
+
+  test('sendStreamingMessage stream closes when task completes', async () => {
+    await post(`${base}/register`, { session_id: 'stream-2', label: 'Stream2' })
+    const res = await fetch(`${base}/agents/stream-2/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'a2a-version': '1.0' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 8, method: 'sendStreamingMessage',
+        params: { message: { parts: [{ kind: 'text', text: 'do work' }] } },
+      }),
+    })
+    const reader = res.body.getReader()
+    // Get the taskId from the first event, then complete it
+    const firstEvents = await readSseEvents(reader, 1, 300)
+    const taskId = firstEvents[0]?.result?.task?.id
+    assert.ok(taskId, 'should have taskId from first event')
+
+    // Complete the task — stream should get one more event then close
+    await post(`${base}/send`, {
+      event: 'agent_response', session_id: 'stream-2', task_id: taskId, result: { done: true },
+    })
+    // Read the completion event
+    const moreEvents = await readSseEvents(reader, 1, 300)
+    const allEvents = [...firstEvents, ...moreEvents]
+    const completed = allEvents.find(e => e.result?.task?.status?.state === 'completed')
+    assert.ok(completed, 'should have a completed event')
+  })
+
+  test('sendStreamingMessage on /agents/:id/a2a returns error for unknown agent', async () => {
+    const res = await fetch(`${base}/agents/no-such/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'sendStreamingMessage',
+        params: { message: { parts: [{ text: 'x' }] } },
+      }),
+    })
+    const json = await res.json()
+    assert.equal(json.error.code, -32001)
+  })
+})
+
+// ---------------------------------------------------------------------------
 describe('input_required state and task resumption', () => {
   test('sending answer directive resumes input_required task to working', async () => {
     await post(`${base}/register`, { session_id: 'ir-1', label: 'IR Agent' })
