@@ -22,6 +22,9 @@ import {
   handleA2aRequest,
   validateA2aVersion,
   SUPPORTED_A2A_VERSIONS,
+  TERMINAL_STATES,
+  VALID_TRANSITIONS,
+  isValidTransition,
   normalizePart,
   normalizeArtifact,
   extractTextFromParts,
@@ -301,6 +304,7 @@ describe('Task management', () => {
 
   test('updateTask updates fields', () => {
     const task = createTask('sess-1', {})
+    updateTask(task.id, { status: { state: 'working' } })
     updateTask(task.id, { status: { state: 'completed' }, result: { answer: 42 } })
     const updated = getTask(task.id)
     assert.equal(updated.status.state, 'completed')
@@ -323,6 +327,78 @@ describe('Task management', () => {
     const task = createTask('s', {})
     pruneExpiredTasks()
     assert.ok(getTask(task.id))
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('isValidTransition', () => {
+  test('submitted → working is valid', () => assert.ok(isValidTransition('submitted', 'working')))
+  test('submitted → completed is valid (sync coordinator)', () => assert.ok(isValidTransition('submitted', 'completed')))
+  test('submitted → rejected is valid', () => assert.ok(isValidTransition('submitted', 'rejected')))
+  test('working → completed is valid', () => assert.ok(isValidTransition('working', 'completed')))
+  test('working → failed is valid', () => assert.ok(isValidTransition('working', 'failed')))
+  test('working → input_required is valid', () => assert.ok(isValidTransition('working', 'input_required')))
+  test('input_required → working is valid', () => assert.ok(isValidTransition('input_required', 'working')))
+  test('completed → working is invalid', () => assert.ok(!isValidTransition('completed', 'working')))
+  test('failed → working is invalid', () => assert.ok(!isValidTransition('failed', 'working')))
+  test('canceled → completed is invalid', () => assert.ok(!isValidTransition('canceled', 'completed')))
+  test('rejected → working is invalid', () => assert.ok(!isValidTransition('rejected', 'working')))
+  test('TERMINAL_STATES covers completed/failed/canceled/rejected', () => {
+    assert.ok(TERMINAL_STATES.has('completed'))
+    assert.ok(TERMINAL_STATES.has('failed'))
+    assert.ok(TERMINAL_STATES.has('canceled'))
+    assert.ok(TERMINAL_STATES.has('rejected'))
+  })
+})
+
+describe('updateTask — state transition validation', () => {
+  test('allows valid transition submitted → working', () => {
+    const task = createTask('s', {})
+    const result = updateTask(task.id, { status: { state: 'working' } })
+    assert.ok(!result?.error)
+    assert.equal(getTask(task.id).status.state, 'working')
+  })
+
+  test('rejects invalid transition completed → working', () => {
+    const task = createTask('s', {})
+    updateTask(task.id, { status: { state: 'working' } })
+    updateTask(task.id, { status: { state: 'completed' } })
+    const result = updateTask(task.id, { status: { state: 'working' } })
+    assert.ok(result?.error)
+    assert.ok(result.error.includes('invalid_transition'))
+    // State must not have changed
+    assert.equal(getTask(task.id).status.state, 'completed')
+  })
+
+  test('non-state patches always succeed', () => {
+    const task = createTask('s', {})
+    const result = updateTask(task.id, { result: { foo: 'bar' } })
+    assert.ok(!result?.error)
+    assert.equal(getTask(task.id).result.foo, 'bar')
+  })
+})
+
+describe('createTask — message normalization', () => {
+  test('normalizes legacy parts on creation', () => {
+    const task = createTask('s', { role: 'user', parts: [{ text: 'hello' }] })
+    assert.equal(task.message.parts[0].kind, 'text')
+    assert.equal(task.message.parts[0].text, 'hello')
+  })
+
+  test('preserves spec-compliant parts unchanged', () => {
+    const part = { kind: 'text', text: 'hi', mediaType: 'text/plain' }
+    const task = createTask('s', { parts: [part] })
+    assert.deepEqual(task.message.parts[0], part)
+  })
+
+  test('stores metadata when provided', () => {
+    const task = createTask('s', {}, null, { priority: 'high' })
+    assert.deepEqual(task.metadata, { priority: 'high' })
+  })
+
+  test('no metadata field when not provided', () => {
+    const task = createTask('s', {})
+    assert.ok(!('metadata' in task))
   })
 })
 
@@ -467,6 +543,7 @@ describe('handleA2aRequest', () => {
 
   test('cancelTask returns error when task already completed', () => {
     const task = createTask('s', {})
+    updateTask(task.id, { status: { state: 'working' } })
     updateTask(task.id, { status: { state: 'completed' } })
     const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'cancelTask', params: { taskId: task.id } }, null, 'http://test.local')
     assert.equal(res.error.code, -32002)
@@ -490,6 +567,7 @@ describe('handleA2aRequest', () => {
 
   test('listTasks filters by status', () => {
     const t1 = createTask('s1', {})
+    updateTask(t1.id, { status: { state: 'working' } })
     updateTask(t1.id, { status: { state: 'completed' } })
     createTask('s2', {}) // stays submitted
     const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'listTasks', params: { status: 'completed' } }, null, 'http://test.local')

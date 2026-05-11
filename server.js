@@ -299,16 +299,42 @@ export function extractTextFromParts(parts) {
 
 const TASK_TTL_MS = 60 * 60 * 1000 // 1 hour
 
-export function createTask(sessionId, message, contextId = null) {
+export const TERMINAL_STATES = new Set(['completed', 'failed', 'canceled', 'rejected'])
+
+// Valid state transitions per A2A v1.0 spec
+export const VALID_TRANSITIONS = {
+  submitted:      new Set(['working', 'completed', 'rejected', 'canceled']),
+  working:        new Set(['completed', 'failed', 'canceled', 'input_required']),
+  input_required: new Set(['working', 'canceled', 'failed']),
+  completed:      new Set(),
+  failed:         new Set(),
+  canceled:       new Set(),
+  rejected:       new Set(),
+  auth_required:  new Set(['working', 'canceled', 'failed']),
+}
+
+export function isValidTransition(fromState, toState) {
+  return VALID_TRANSITIONS[fromState]?.has(toState) ?? false
+}
+
+/** Normalize message parts in-place for spec compliance before storage. */
+function normalizeMessage(message) {
+  if (!message || typeof message !== 'object') return message
+  if (!Array.isArray(message.parts)) return message
+  return { ...message, parts: message.parts.map(normalizePart).filter(Boolean) }
+}
+
+export function createTask(sessionId, message, contextId = null, metadata = null) {
   const id = crypto.randomUUID()
   const task = {
     id,
     contextId: contextId ?? crypto.randomUUID(),
     session_id: sessionId,
     status: { state: 'submitted' },
-    message,
+    message: normalizeMessage(message),
     result: null,
     artifacts: [],
+    ...(metadata ? { metadata } : {}),
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
@@ -319,6 +345,17 @@ export function createTask(sessionId, message, contextId = null) {
 export function updateTask(taskId, patch) {
   const task = tasks.get(taskId)
   if (!task) return null
+  // Validate state transition if state is changing
+  if (patch.status?.state && patch.status.state !== task.status.state) {
+    if (!isValidTransition(task.status.state, patch.status.state)) {
+      process.stderr.write(`[switchboard] invalid transition ${task.status.state} → ${patch.status.state} for task ${taskId.slice(0,8)}\n`)
+      return { error: `invalid_transition:${task.status.state}→${patch.status.state}`, task }
+    }
+  }
+  // Normalize artifacts if provided
+  if (Array.isArray(patch.artifacts)) {
+    patch = { ...patch, artifacts: patch.artifacts.map(normalizeArtifact).filter(Boolean) }
+  }
   Object.assign(task, patch, { updated_at: new Date().toISOString() })
   return task
 }
@@ -383,8 +420,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
     if (!task) {
       return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Task not found' } }
     }
-    const terminal = ['completed', 'failed', 'canceled', 'rejected']
-    if (terminal.includes(task.status.state)) {
+    if (TERMINAL_STATES.has(task.status.state)) {
       return { jsonrpc: '2.0', id, error: { code: -32002, message: `Task already in terminal state: ${task.status.state}` } }
     }
     updateTask(taskId, { status: { state: 'canceled' } })
@@ -641,11 +677,14 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'task_not_found' }) }] }
       }
       const newState = taskError ? 'failed' : 'completed'
-      updateTask(task_id, {
+      const updated = updateTask(task_id, {
         status: taskError ? { state: 'failed', error: taskError } : { state: 'completed' },
         result: result ?? null,
         artifacts,
       })
+      if (updated?.error) {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: updated.error }) }] }
+      }
       process.stderr.write(`[switchboard] task ${newState}: ${task_id.slice(0,8)}\n`)
       broadcastNotification('notifications/message', {
         content: `Task ${task_id.slice(0,8)} ${newState}`,
