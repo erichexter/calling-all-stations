@@ -575,6 +575,41 @@ describe('handleA2aRequest', () => {
     assert.equal(res.result.tasks[0].status.state, 'completed')
   })
 
+  test('rejectTask sets state to rejected', () => {
+    registry.set('sess-rj', { session_id: 'sess-rj', label: 'RJ', status: 'running', current_step: 'idle', skills: [] })
+    inboxes.set('sess-rj', [])
+    const task = createTask('sess-rj', {})
+    updateTask(task.id, { status: { state: 'working' } })
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'rejectTask', params: { taskId: task.id, reason: 'out of scope' } },
+      null, 'http://test.local'
+    )
+    assert.ok(!res.error)
+    assert.equal(res.result.task.status.state, 'rejected')
+    assert.equal(res.result.task.status.reason, 'out of scope')
+  })
+
+  test('rejectTask on submitted task is valid (submitted → rejected)', () => {
+    const task = createTask('s', {})
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'rejectTask', params: { taskId: task.id } },
+      null, 'http://test.local'
+    )
+    assert.ok(!res.error)
+    assert.equal(res.result.task.status.state, 'rejected')
+  })
+
+  test('rejectTask on terminal task returns -32002', () => {
+    const task = createTask('s', {})
+    updateTask(task.id, { status: { state: 'working' } })
+    updateTask(task.id, { status: { state: 'completed' } })
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'rejectTask', params: { taskId: task.id } },
+      null, 'http://test.local'
+    )
+    assert.equal(res.error.code, -32002)
+  })
+
   test('sendMessage passes returnImmediately in directive body', () => {
     registry.set('sess-ri', { session_id: 'sess-ri', label: 'RI', status: 'running', current_step: 'idle', skills: [] })
     inboxes.set('sess-ri', [])

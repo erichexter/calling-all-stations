@@ -303,14 +303,14 @@ export const TERMINAL_STATES = new Set(['completed', 'failed', 'canceled', 'reje
 
 // Valid state transitions per A2A v1.0 spec
 export const VALID_TRANSITIONS = {
-  submitted:      new Set(['working', 'completed', 'rejected', 'canceled']),
-  working:        new Set(['completed', 'failed', 'canceled', 'input_required']),
-  input_required: new Set(['working', 'canceled', 'failed']),
+  submitted:      new Set(['working', 'completed', 'rejected', 'canceled', 'auth_required']),
+  working:        new Set(['completed', 'failed', 'canceled', 'input_required', 'rejected']),
+  input_required: new Set(['working', 'canceled', 'failed', 'rejected']),
+  auth_required:  new Set(['working', 'canceled', 'failed', 'rejected']),
   completed:      new Set(),
   failed:         new Set(),
   canceled:       new Set(),
   rejected:       new Set(),
-  auth_required:  new Set(['working', 'canceled', 'failed']),
 }
 
 export function isValidTransition(fromState, toState) {
@@ -435,6 +435,24 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
     if (statusFilter) results = results.filter(t => t.status.state === statusFilter)
     const page = results.slice(offset, offset + limit)
     return { jsonrpc: '2.0', id, result: { tasks: page, total: results.length, offset, limit } }
+  }
+
+  if (method === 'rejectTask') {
+    const taskId = params?.taskId ?? params?.id
+    const reason = params?.reason ?? 'Agent rejected task'
+    if (!taskId) {
+      return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing taskId' } }
+    }
+    const task = getTask(taskId)
+    if (!task) {
+      return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Task not found' } }
+    }
+    if (TERMINAL_STATES.has(task.status.state)) {
+      return { jsonrpc: '2.0', id, error: { code: -32002, message: `Task already in terminal state: ${task.status.state}` } }
+    }
+    updateTask(taskId, { status: { state: 'rejected', reason } })
+    process.stderr.write(`[switchboard] A2A task ${taskId.slice(0,8)} rejected: ${reason}\n`)
+    return { jsonrpc: '2.0', id, result: { task: getTask(taskId) } }
   }
 
   if (method === 'message/send' || method === 'sendMessage') {
@@ -579,8 +597,21 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
             question:   { type: 'string', description: 'Question text (for agent_question)' },
             blocking:   { type: 'boolean', description: 'true for agent_question — signals you will poll check_inbox for an answer' },
             step:       { type: 'string', description: 'Current step label (updates your registry entry)' },
+            task_id:    { type: 'string', description: 'Active task ID — if provided with agent_question+blocking, task moves to input_required state' },
           },
           required: ['event', 'session_id'],
+        },
+      },
+      {
+        name: 'reject_task',
+        description: 'Reject an A2A task that was routed to you — use when the task is outside your capabilities or you cannot process it.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            task_id: { type: 'string', description: 'The task_id from the a2a_message directive body' },
+            reason:  { type: 'string', description: 'Human-readable reason for rejection' },
+          },
+          required: ['task_id'],
         },
       },
       {
@@ -637,7 +668,17 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       inboxes.get(session_id).push(directive)
       if (type === 'answer') {
         const entry = registry.get(session_id)
-        if (entry) { entry.waiting_for_answer = false; entry.last_status_at = new Date().toISOString() }
+        if (entry) {
+          entry.waiting_for_answer = false
+          entry.last_status_at = new Date().toISOString()
+          // Resume any input_required task for this agent back to working
+          for (const task of tasks.values()) {
+            if (task.session_id === session_id && task.status.state === 'input_required') {
+              updateTask(task.id, { status: { state: 'working' } })
+              break
+            }
+          }
+        }
       }
       persistState()
       process.stderr.write(`[switchboard] directive -> ${session_id.slice(0,8)}: ${type}\n`)
@@ -645,7 +686,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
     }
 
     if (name === 'send') {
-      const { event: eventType, session_id, message, question, blocking, step } = args
+      const { event: eventType, session_id, message, question, blocking, step, task_id } = args
       autoRegister(session_id, `MCP send(${eventType})`)
       const entry = registry.get(session_id)
       if (entry) {
@@ -654,6 +695,13 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
           entry.waiting_for_answer = true
           entry.question    = question ?? null
           entry.question_at = new Date().toISOString()
+          // Transition active task to input_required if task_id provided
+          if (task_id) {
+            const t = getTask(task_id)
+            if (t && !TERMINAL_STATES.has(t.status.state)) {
+              updateTask(task_id, { status: { state: 'input_required', question: question ?? null } })
+            }
+          }
         }
       }
       const msgId = `m${Date.now()}-${++seq}`
@@ -664,10 +712,29 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
           message_id: msgId, ts: new Date().toISOString(),
           event: eventType, session_id,
           question: question ?? null, blocking: blocking ?? false, step: step ?? null,
+          task_id: task_id ?? null,
         },
       })
       process.stderr.write(`[switchboard] send event=${eventType} session=${session_id.slice(0,8)}\n`)
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, message_id: msgId }) }] }
+    }
+
+    if (name === 'reject_task') {
+      const { task_id, reason = 'Agent rejected task' } = args
+      const task = getTask(task_id)
+      if (!task) {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'task_not_found' }) }] }
+      }
+      if (TERMINAL_STATES.has(task.status.state)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: `already_terminal:${task.status.state}` }) }] }
+      }
+      updateTask(task_id, { status: { state: 'rejected', reason } })
+      process.stderr.write(`[switchboard] task rejected: ${task_id.slice(0,8)}\n`)
+      broadcastNotification('notifications/message', {
+        content: `Task ${task_id.slice(0,8)} rejected`,
+        meta: { message_id: `m${Date.now()}`, ts: new Date().toISOString(), event: 'agent_response', task_id, state: 'rejected', reason },
+      })
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, task_id, state: 'rejected' }) }] }
     }
 
     if (name === 'complete_task') {
@@ -963,6 +1030,13 @@ export function createAppServer() {
             entry.waiting_for_answer = true
             entry.question    = question ?? null
             entry.question_at = new Date().toISOString()
+            // Transition active task to input_required
+            if (task_id) {
+              const t = getTask(task_id)
+              if (t && !TERMINAL_STATES.has(t.status.state)) {
+                updateTask(task_id, { status: { state: 'input_required', question: question ?? null } })
+              }
+            }
           }
         }
         // agent_response: complete the referenced A2A task
@@ -1009,7 +1083,17 @@ export function createAppServer() {
         inboxes.get(session_id).push(directive)
         if (type === 'answer') {
           const entry = registry.get(session_id)
-          if (entry) { entry.waiting_for_answer = false; entry.last_status_at = new Date().toISOString() }
+          if (entry) {
+            entry.waiting_for_answer = false
+            entry.last_status_at = new Date().toISOString()
+            // Resume any input_required task back to working
+            for (const task of tasks.values()) {
+              if (task.session_id === session_id && task.status.state === 'input_required') {
+                updateTask(task.id, { status: { state: 'working' } })
+                break
+              }
+            }
+          }
         }
         persistState()
         process.stderr.write(`[switchboard] HTTP send-directive -> ${session_id.slice(0,8)}: ${type}\n`)

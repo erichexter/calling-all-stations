@@ -535,6 +535,76 @@ describe('A2A spec-compliant method names', () => {
 })
 
 // ---------------------------------------------------------------------------
+describe('input_required state and task resumption', () => {
+  test('sending answer directive resumes input_required task to working', async () => {
+    await post(`${base}/register`, { session_id: 'ir-1', label: 'IR Agent' })
+    // Create task in working state
+    const send = await post(`${base}/agents/ir-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { message: { parts: [{ kind: 'text', text: 'do work' }] } },
+    })
+    const taskId = send.json.result.task.id
+
+    // Move task to input_required via send with task_id
+    await post(`${base}/send`, {
+      event: 'agent_question',
+      session_id: 'ir-1',
+      question: 'which option?',
+      blocking: true,
+      task_id: taskId,
+    })
+
+    // Verify task is input_required
+    const check1 = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'getTask', params: { taskId },
+    })
+    assert.equal(check1.json.result.task.status.state, 'input_required')
+
+    // Send answer — task should resume to working
+    await post(`${base}/send-directive`, {
+      session_id: 'ir-1', type: 'answer', body: { answer: 'option A' },
+    })
+    const check2 = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 3, method: 'getTask', params: { taskId },
+    })
+    assert.equal(check2.json.result.task.status.state, 'working')
+  })
+})
+
+describe('rejected and auth_required task states', () => {
+  test('rejectTask via JSON-RPC returns rejected state', async () => {
+    await post(`${base}/register`, { session_id: 'rj-1', label: 'Rejector' })
+    const send = await post(`${base}/agents/rj-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { message: { parts: [{ kind: 'text', text: 'do impossible thing' }] } },
+    })
+    const taskId = send.json.result.task.id
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'rejectTask', params: { taskId, reason: 'not capable' },
+    })
+    assert.ok(!json.error)
+    assert.equal(json.result.task.status.state, 'rejected')
+    assert.equal(json.result.task.status.reason, 'not capable')
+  })
+
+  test('cannot cancel a rejected task', async () => {
+    await post(`${base}/register`, { session_id: 'rj-2', label: 'RJ2' })
+    const send = await post(`${base}/agents/rj-2/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: { message: { parts: [{ kind: 'text', text: 'x' }] } },
+    })
+    const taskId = send.json.result.task.id
+    await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'rejectTask', params: { taskId },
+    })
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 3, method: 'cancelTask', params: { taskId },
+    })
+    assert.equal(json.error.code, -32002)
+  })
+})
+
+// ---------------------------------------------------------------------------
 describe('Existing REST endpoints still work', () => {
   test('POST /register → POST /check-inbox → POST /send-directive round-trip', async () => {
     await post(`${base}/register`, { session_id: 'rest-1', label: 'REST Agent' })
