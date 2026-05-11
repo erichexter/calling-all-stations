@@ -347,6 +347,90 @@ describe('Full A2A round-trip', () => {
 })
 
 // ---------------------------------------------------------------------------
+describe('POST /send with event=agent_response completes A2A task', () => {
+  test('updates task state to completed', async () => {
+    // Register agent and create a task via A2A
+    await post(`${base}/register`, { session_id: 'resp-1', label: 'Response Agent' })
+    const send = await post(`${base}/agents/resp-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'message/send',
+      params: { message: { parts: [{ text: 'do work' }] } },
+    })
+    const taskId = send.json.result.task.id
+    assert.equal(send.json.result.task.status.state, 'working')
+
+    // Agent completes via HTTP /send
+    await post(`${base}/send`, {
+      event: 'agent_response',
+      session_id: 'resp-1',
+      task_id: taskId,
+      result: { output: 'work done' },
+    })
+
+    // Verify task is completed
+    const check = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'tasks/get', params: { taskId },
+    })
+    assert.equal(check.json.result.task.status.state, 'completed')
+    assert.deepEqual(check.json.result.task.result, { output: 'work done' })
+  })
+
+  test('agent_response without task_id still broadcasts normally', async () => {
+    const { json } = await post(`${base}/send`, {
+      event: 'agent_response',
+      session_id: 'anon',
+      message: 'finished',
+    })
+    assert.equal(json.ok, true)
+    assert.ok(json.message_id)
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('POST /a2a message/stream — SSE streaming', () => {
+  test('returns SSE stream with working then completed events', async () => {
+    const res = await fetch(`${base}/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 42,
+        method: 'message/stream',
+        params: { message: { role: 'user', parts: [{ text: 'stream this' }] } },
+      }),
+    })
+    assert.equal(res.status, 200)
+    assert.ok(res.headers.get('content-type').includes('text/event-stream'))
+
+    const text = await res.text()
+    const events = text.split('\n\n').filter(Boolean).map(chunk => {
+      const dataLine = chunk.split('\n').find(l => l.startsWith('data:'))
+      return dataLine ? JSON.parse(dataLine.slice(5)) : null
+    }).filter(Boolean)
+
+    assert.ok(events.length >= 2, `Expected at least 2 SSE events, got ${events.length}`)
+
+    const working = events.find(e => e.result?.task?.status?.state === 'working')
+    assert.ok(working, 'Should have a working state event')
+
+    const completed = events.find(e => e.result?.task?.status?.state === 'completed')
+    assert.ok(completed, 'Should have a completed state event')
+
+    // Both events should have the same task id
+    assert.equal(working.result.task.id, completed.result.task.id)
+    assert.equal(working.id, 42)
+  })
+
+  test('stream returns error when message is missing', async () => {
+    const res = await fetch(`${base}/a2a`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'message/stream', params: {} }),
+    })
+    const json = await res.json()
+    assert.equal(json.error.code, -32602)
+  })
+})
+
+// ---------------------------------------------------------------------------
 describe('Existing REST endpoints still work', () => {
   test('POST /register → POST /check-inbox → POST /send-directive round-trip', async () => {
     await post(`${base}/register`, { session_id: 'rest-1', label: 'REST Agent' })

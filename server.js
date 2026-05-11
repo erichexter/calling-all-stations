@@ -616,6 +616,53 @@ export function createAppServer() {
           res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }))
           return
         }
+
+        // message/stream — SSE streaming response
+        if (payload.method === 'message/stream') {
+          const { id, params } = payload
+          const message = params?.message
+          if (!message) {
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing message' } }))
+            return
+          }
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+          })
+
+          const sendEvent = (data) => {
+            res.write(`data: ${JSON.stringify(data)}\n\n`)
+          }
+
+          // Emit working status immediately
+          const taskId = crypto.randomUUID()
+          sendEvent({ jsonrpc: '2.0', id, result: { task: { id: taskId, status: { state: 'working' } } } })
+
+          // Broadcast and stream the result
+          const skill = params?.skill
+          const text = Array.isArray(message.parts)
+            ? message.parts.map(p => p.text ?? '').join(' ')
+            : (message.text ?? JSON.stringify(message))
+          const msgId = `m${Date.now()}-${++seq}`
+          broadcastNotification('notifications/message', {
+            content: text,
+            meta: { message_id: msgId, ts: new Date().toISOString(), event: 'a2a_stream', task_id: taskId },
+          })
+          process.stderr.write(`[switchboard] A2A stream ${taskId.slice(0,8)}\n`)
+
+          // Emit completion
+          setTimeout(() => {
+            sendEvent({
+              jsonrpc: '2.0', id,
+              result: { task: { id: taskId, status: { state: 'completed' }, result: { message_id: msgId } } },
+            })
+            res.end()
+          }, 100)
+          return
+        }
+
         const result = handleA2aRequest(payload, null, getServerUrl())
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify(result))
@@ -746,7 +793,7 @@ export function createAppServer() {
       }
 
       if (req.url === '/send') {
-        const { event: eventType, session_id, message, question, blocking, step } = payload
+        const { event: eventType, session_id, message, question, blocking, step, task_id, result, artifacts } = payload
         if (session_id) autoRegister(session_id, `HTTP /send(${eventType})`)
         const entry = session_id ? registry.get(session_id) : null
         if (entry) {
@@ -757,6 +804,18 @@ export function createAppServer() {
             entry.question_at = new Date().toISOString()
           }
         }
+        // agent_response: complete the referenced A2A task
+        if (eventType === 'agent_response' && task_id) {
+          const task = getTask(task_id)
+          if (task) {
+            updateTask(task_id, {
+              status: { state: 'completed' },
+              result: result ?? { message },
+              artifacts: Array.isArray(artifacts) ? artifacts : [],
+            })
+            process.stderr.write(`[switchboard] HTTP agent_response completed task ${task_id.slice(0,8)}\n`)
+          }
+        }
         const msgId = `m${Date.now()}-${++seq}`
         const content = message ?? question ?? `${eventType}:${session_id}`
         broadcastNotification('notifications/message', {
@@ -765,6 +824,7 @@ export function createAppServer() {
             message_id: msgId, ts: new Date().toISOString(),
             event: eventType, session_id,
             question: question ?? null, blocking: blocking ?? false, step: step ?? null,
+            task_id: task_id ?? null,
           },
         })
         res.writeHead(200, { 'content-type': 'application/json' })
