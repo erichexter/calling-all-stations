@@ -585,7 +585,7 @@ const mcpSessions = new Map()
 
 export function broadcastNotification(method, params) {
   for (const [, { server }] of mcpSessions) {
-    try { server.notification({ method, params }) } catch {}
+    try { server.notification({ method, params }).catch(() => {}) } catch {}
   }
 }
 
