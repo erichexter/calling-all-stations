@@ -400,6 +400,16 @@ describe('createTask — message normalization', () => {
     const task = createTask('s', {})
     assert.ok(!('metadata' in task))
   })
+
+  test('stores extensions when provided', () => {
+    const task = createTask('s', {}, null, null, { vendor: 'x' })
+    assert.deepEqual(task.extensions, { vendor: 'x' })
+  })
+
+  test('no extensions field when not provided', () => {
+    const task = createTask('s', {})
+    assert.ok(!('extensions' in task))
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -573,6 +583,41 @@ describe('handleA2aRequest', () => {
     const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'listTasks', params: { status: 'completed' } }, null, 'http://test.local')
     assert.equal(res.result.tasks.length, 1)
     assert.equal(res.result.tasks[0].status.state, 'completed')
+  })
+
+  test('getExtendedAgentCard returns coordinator card', () => {
+    const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'getExtendedAgentCard', params: {} }, null, 'http://test.local')
+    assert.ok(!res.error)
+    assert.equal(res.result.agentCard.name, 'calling-all-stations')
+    assert.ok(Array.isArray(res.result.agentCard.skills))
+  })
+
+  test('sendMessage stores metadata on task', () => {
+    registry.set('sess-meta', { session_id: 'sess-meta', label: 'M', status: 'running', current_step: 'idle', skills: [] })
+    inboxes.set('sess-meta', [])
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'sendMessage', params: {
+        metadata: { priority: 'high' },
+        message: { parts: [{ kind: 'text', text: 'hi' }] }
+      }},
+      'sess-meta', 'http://test.local'
+    )
+    assert.ok(!res.error)
+    assert.deepEqual(res.result.task.metadata, { priority: 'high' })
+  })
+
+  test('sendMessage stores extensions on task', () => {
+    registry.set('sess-ext', { session_id: 'sess-ext', label: 'E', status: 'running', current_step: 'idle', skills: [] })
+    inboxes.set('sess-ext', [])
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'sendMessage', params: {
+        extensions: { vendor: 'acme' },
+        message: { parts: [{ kind: 'text', text: 'hi' }] }
+      }},
+      'sess-ext', 'http://test.local'
+    )
+    assert.ok(!res.error)
+    assert.deepEqual(res.result.task.extensions, { vendor: 'acme' })
   })
 
   test('rejectTask sets state to rejected', () => {

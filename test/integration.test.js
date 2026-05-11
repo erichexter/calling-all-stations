@@ -523,6 +523,31 @@ describe('A2A spec-compliant method names', () => {
     assert.equal(res.headers.get('a2a-version'), '1.0')
   })
 
+  test('getExtendedAgentCard returns coordinator card', async () => {
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'getExtendedAgentCard', params: {},
+    })
+    assert.ok(!json.error)
+    assert.equal(json.result.agentCard.name, 'calling-all-stations')
+    assert.ok(Array.isArray(json.result.agentCard.skills))
+    assert.ok(json.result.agentCard.provider)
+  })
+
+  test('sendMessage stores metadata and extensions on task', async () => {
+    await post(`${base}/register`, { session_id: 'meta-1', label: 'Meta Agent' })
+    const { json } = await post(`${base}/agents/meta-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'sendMessage',
+      params: {
+        metadata: { priority: 'urgent' },
+        extensions: { tenant: 'acme' },
+        message: { parts: [{ kind: 'text', text: 'do it' }] },
+      },
+    })
+    assert.ok(!json.error)
+    assert.deepEqual(json.result.task.metadata, { priority: 'urgent' })
+    assert.deepEqual(json.result.task.extensions, { tenant: 'acme' })
+  })
+
   test('unsupported A2A-Version returns -32003', async () => {
     const res = await fetch(`${base}/a2a`, {
       method: 'POST',

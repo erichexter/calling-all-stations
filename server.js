@@ -324,7 +324,7 @@ function normalizeMessage(message) {
   return { ...message, parts: message.parts.map(normalizePart).filter(Boolean) }
 }
 
-export function createTask(sessionId, message, contextId = null, metadata = null) {
+export function createTask(sessionId, message, contextId = null, metadata = null, extensions = null) {
   const id = crypto.randomUUID()
   const task = {
     id,
@@ -334,7 +334,8 @@ export function createTask(sessionId, message, contextId = null, metadata = null
     message: normalizeMessage(message),
     result: null,
     artifacts: [],
-    ...(metadata ? { metadata } : {}),
+    ...(metadata   ? { metadata }   : {}),
+    ...(extensions ? { extensions } : {}),
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
@@ -464,6 +465,12 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
     return { jsonrpc: '2.0', id, result: { tasks: page, total: results.length, offset, limit } }
   }
 
+  if (method === 'getExtendedAgentCard') {
+    // Returns the full coordinator card (same as /.well-known/agent-card.json for now).
+    // In authenticated contexts this could include private skill details or rate limits.
+    return { jsonrpc: '2.0', id, result: { agentCard: buildCoordinatorCard() } }
+  }
+
   if (method === 'subscribeToTask') {
     // subscribeToTask is SSE-based — cannot be handled in the pure JSON-RPC function.
     // Return a sentinel so the HTTP layer can set up the SSE stream.
@@ -508,7 +515,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
         return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Agent not found' } }
       }
       const returnImmediately = params?.returnImmediately !== false // default true for non-blocking
-      const task = createTask(sessionId, message, params?.contextId ?? null)
+      const task = createTask(sessionId, message, params?.contextId ?? null, params?.metadata ?? null, params?.extensions ?? null)
       const directive = {
         id: crypto.randomUUID(),
         type: 'a2a_message',
@@ -538,7 +545,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
       if (!target) {
         return { jsonrpc: '2.0', id, error: { code: -32001, message: `No running agent with skill: ${skill}` } }
       }
-      const task = createTask(target.session_id, message, params?.contextId ?? null)
+      const task = createTask(target.session_id, message, params?.contextId ?? null, params?.metadata ?? null, params?.extensions ?? null)
       const directive = {
         id: crypto.randomUUID(),
         type: 'a2a_message',
