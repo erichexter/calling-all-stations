@@ -782,6 +782,14 @@ describe('Existing REST endpoints still work', () => {
     assert.equal(inbox.json.directives[0].body.text, 'hello')
   })
 
+  test('DELETE /deregister/:id removes agent', async () => {
+    await post(`${base}/register`, { session_id: 'del-1', label: 'Delete Me' })
+    assert.ok(registry.has('del-1'))
+    const res = await fetch(`${base}/deregister/del-1`, { method: 'DELETE' })
+    assert.equal(res.status, 204)
+    assert.ok(!registry.has('del-1'))
+  })
+
   test('GET /registry returns all agents', async () => {
     await post(`${base}/register`, { session_id: 'reg-1', label: 'R1' })
     await post(`${base}/register`, { session_id: 'reg-2', label: 'R2' })

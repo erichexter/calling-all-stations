@@ -31,6 +31,7 @@ import { Server }                        from '@modelcontextprotocol/sdk/server/
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { createServer }                  from 'node:http'
+import { fileURLToPath }                 from 'node:url'
 import fs                                from 'node:fs'
 import path                              from 'node:path'
 import crypto                            from 'node:crypto'
@@ -1081,6 +1082,16 @@ export function createAppServer() {
       return
     }
 
+    // DELETE /deregister/:session_id
+    if (req.method === 'DELETE' && req.url.startsWith('/deregister/')) {
+      const session_id = req.url.slice('/deregister/'.length)
+      registry.delete(session_id)
+      inboxes.delete(session_id)
+      persistState()
+      process.stderr.write(`[calling-all-stations] deregistered ${session_id.slice(0,8)}\n`)
+      res.writeHead(204); res.end(); return
+    }
+
     if (req.method !== 'POST') {
       res.writeHead(405); res.end('Method Not Allowed'); return
     }
@@ -1243,8 +1254,10 @@ export function createAppServer() {
 // Entry point
 // ---------------------------------------------------------------------------
 
-// Only start listening when run directly (not imported by tests)
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+// Only start listening when run directly (not imported by tests).
+// Uses fileURLToPath + path.resolve for Windows compatibility (argv[1] may be relative).
+const __filename = fileURLToPath(import.meta.url)
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   hydrateState()
   setInterval(persistState, 30_000)
   setInterval(pruneExpiredTasks, 5 * 60 * 1000)
