@@ -1,4 +1,4 @@
-# switchboard
+# calling-all-stations
 
 A lightweight multi-agent coordination server built on [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http).
 
@@ -34,7 +34,7 @@ Add to `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "switchboard": {
+    "calling-all-stations": {
       "type": "http",
       "url": "http://localhost:8788/mcp"
     }
@@ -47,6 +47,72 @@ Three MCP tools become available: `send`, `check_inbox`, `send_directive`.
 ### Connect via REST (any agent)
 
 No MCP required — use the HTTP endpoints directly.
+
+### Agent skill
+
+Drop `skills/SKILL.md` into your project and add one line to your agent config:
+
+```
+Read skills/SKILL.md from calling-all-stations before starting work.
+```
+
+That's the full integration — the skill tells your agent when to register, when to check inbox, how to ask questions, and how to handle incoming directives.
+
+---
+
+## Running persistently
+
+### PM2 (recommended for Linux/Mac)
+
+```bash
+npm install -g pm2
+pm2 start server.js --name calling-all-stations
+pm2 save
+pm2 startup
+```
+
+### systemd (Linux)
+
+```ini
+[Unit]
+Description=calling-all-stations
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /opt/calling-all-stations/server.js
+Restart=always
+Environment=PORT=8788
+Environment=STATE_FILE=/opt/calling-all-stations/state.json
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable calling-all-stations
+sudo systemctl start calling-all-stations
+```
+
+### Docker
+
+```bash
+docker run -d \
+  --name calling-all-stations \
+  -p 8788:8788 \
+  -e STATE_FILE=/data/state.json \
+  -v $(pwd)/data:/data \
+  node:20-alpine sh -c "npm install && node server.js"
+```
+
+### Windows (Task Scheduler)
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "node.exe" `
+  -Argument "C:\calling-all-stations\server.js" `
+  -WorkingDirectory "C:\calling-all-stations"
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+Register-ScheduledTask -TaskName "CallingAllStations" -Action $action -Trigger $trigger -RunLevel Highest
+```
 
 ---
 
