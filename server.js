@@ -1,21 +1,30 @@
 /**
- * switchboard/server.js
+ * calling-all-stations/server.js
  *
- * A lightweight multi-agent coordination server built on MCP Streamable HTTP.
+ * A lightweight multi-agent coordination server supporting both MCP Streamable
+ * HTTP and the Agent-to-Agent (A2A) protocol (v1.0).
  *
  * Agents register, send messages, ask questions, and receive directives through
- * a shared registry + inbox system. Any HTTP client can participate — MCP is
- * the native interface for Claude agents, but the REST endpoints are
- * vendor-neutral so any agent runtime can use them directly.
+ * a shared registry + inbox system. Supports three client interfaces:
+ *   - MCP Streamable HTTP  — native for Claude and MCP-compatible agents
+ *   - A2A JSON-RPC 2.0     — interoperates with LangGraph, Bedrock, Vertex AI, etc.
+ *   - REST HTTP            — vendor-neutral fallback for any HTTP client
  *
- * MCP endpoint:  POST/GET/DELETE http://localhost:PORT/mcp
- * REST endpoints: /register  /deregister/:id  /send  /send-directive
- *                 /check-inbox  /status  /registry  /health
+ * Endpoints:
+ *   MCP:  POST/GET/DELETE /mcp
+ *   A2A:  POST /a2a  (coordinator)
+ *         POST /agents/:id/a2a  (per-agent proxy)
+ *         GET  /.well-known/agent-card.json
+ *         GET  /agents/  (directory)
+ *         GET  /agents/:id/agent-card.json
+ *   REST: /register  /deregister/:id  /send  /send-directive
+ *         /check-inbox  /status  /registry  /health  /skills
  *
  * Configuration (env vars):
- *   PORT            — HTTP port (default: 8788)
- *   BIND_HOST       — bind address (default: 0.0.0.0)
- *   STATE_FILE      — path to persistence JSON (default: ./switchboard-state.json)
+ *   PORT        — HTTP port (default: 8788)
+ *   BIND_HOST   — bind address (default: 0.0.0.0)
+ *   STATE_FILE  — persistence JSON path (default: ./switchboard-state.json)
+ *   SERVER_URL  — public base URL for agent cards (default: http://localhost:PORT)
  */
 
 import { Server }                        from '@modelcontextprotocol/sdk/server/index.js'
@@ -26,16 +35,24 @@ import fs                                from 'node:fs'
 import path                              from 'node:path'
 import crypto                            from 'node:crypto'
 
-const PORT       = Number(process.env.PORT ?? 8788)
-const BIND_HOST  = process.env.BIND_HOST ?? '0.0.0.0'
-const STATE_FILE = process.env.STATE_FILE ?? path.join(process.cwd(), 'switchboard-state.json')
+export const PORT       = Number(process.env.PORT ?? 8788)
+export const BIND_HOST  = process.env.BIND_HOST ?? '0.0.0.0'
+export const STATE_FILE = process.env.STATE_FILE ?? path.join(process.cwd(), 'switchboard-state.json')
 
-// -- Agent registry (in-memory + file-backed) --------------------------------
+// Exported for tests — overridden via SERVER_URL env var
+export function getServerUrl() {
+  return process.env.SERVER_URL ?? `http://localhost:${PORT}`
+}
 
-const registry = new Map()   // session_id -> agent_info
-const inboxes  = new Map()   // session_id -> [directive, ...]
+// ---------------------------------------------------------------------------
+// Agent registry (in-memory + file-backed)
+// ---------------------------------------------------------------------------
 
-function persistState() {
+export const registry = new Map()   // session_id -> agent_info
+export const inboxes  = new Map()   // session_id -> [directive, ...]
+export const tasks    = new Map()   // task_id    -> a2a task object
+
+export function persistState() {
   try {
     const inboxSnapshot = {}
     for (const [id, directives] of inboxes) {
@@ -52,7 +69,7 @@ function persistState() {
   }
 }
 
-function hydrateState() {
+export function hydrateState() {
   try {
     if (!fs.existsSync(STATE_FILE)) return
     const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
@@ -68,27 +85,18 @@ function hydrateState() {
   } catch {}
 }
 
-hydrateState()
-setInterval(persistState, 30_000)
-
-// -- MCP session management --------------------------------------------------
-
-const mcpSessions = new Map()   // MCP transport session ID -> { transport, server }
-let seq = 0
-
-function broadcastNotification(method, params) {
-  for (const [, { server }] of mcpSessions) {
-    try { server.notification({ method, params }) } catch {}
-  }
-}
-
-function autoRegister(session_id, via) {
+export function autoRegister(session_id, via, skills = []) {
   if (!registry.has(session_id)) {
     registry.set(session_id, {
-      session_id, issue_number: null, label: 'auto-registered',
-      started_at: new Date().toISOString(), status: 'running',
-      last_status_at: new Date().toISOString(), current_step: 'starting',
+      session_id,
+      issue_number: null,
+      label: 'auto-registered',
+      started_at: new Date().toISOString(),
+      status: 'running',
+      last_status_at: new Date().toISOString(),
+      current_step: 'starting',
       waiting_for_answer: false,
+      skills: Array.isArray(skills) ? skills : [],
     })
     inboxes.set(session_id, [])
     persistState()
@@ -96,17 +104,286 @@ function autoRegister(session_id, via) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// A2A Agent Card generation
+// ---------------------------------------------------------------------------
+
+export function buildCoordinatorCard() {
+  const base = getServerUrl()
+  return {
+    protocolVersion: '1.0',
+    name: 'calling-all-stations',
+    description:
+      'Multi-agent coordination hub — MCP Streamable HTTP + A2A protocol. ' +
+      'Agents register, broadcast events, ask questions, and receive directed replies. ' +
+      'Bridges MCP-native agents (Claude) with A2A-compatible runtimes (LangGraph, Bedrock, Vertex AI).',
+    url: `${base}/a2a`,
+    humanReadableId: 'calling-all-stations/coordinator',
+    version: '1.0.0',
+    capabilities: {
+      streaming: true,
+      pushNotifications: false,
+      extended_agent_card: false,
+    },
+    skills: [
+      {
+        id: 'broadcast',
+        name: 'Broadcast',
+        description: 'Send an event to all connected MCP agents instantly via SSE push',
+        inputModes: ['application/json'],
+        outputModes: ['application/json'],
+        examples: [{ input: '{"event":"announce","message":"deploy complete"}' }],
+      },
+      {
+        id: 'route-directive',
+        name: 'Route Directive',
+        description: 'Send a directed message to a specific registered agent by session_id',
+        inputModes: ['application/json'],
+        outputModes: ['application/json'],
+      },
+      {
+        id: 'query-registry',
+        name: 'Query Registry',
+        description: 'List all currently registered agents, their status, and declared skills',
+        inputModes: ['application/json'],
+        outputModes: ['application/json'],
+      },
+    ],
+    defaultInputModes: ['application/json'],
+    defaultOutputModes: ['application/json'],
+  }
+}
+
+export function buildAgentCard(session_id) {
+  const entry = registry.get(session_id)
+  if (!entry) return null
+  const base = getServerUrl()
+  const skills = Array.isArray(entry.skills) && entry.skills.length > 0
+    ? entry.skills
+    : [{
+        id: 'general',
+        name: entry.label ?? 'Agent',
+        description: 'General-purpose agent (no skills declared on registration)',
+        inputModes: ['application/json', 'text/plain'],
+        outputModes: ['application/json', 'text/plain'],
+      }]
+  return {
+    protocolVersion: '1.0',
+    name: entry.label ?? session_id,
+    description: `Agent proxied via calling-all-stations coordinator. Status: ${entry.status}.`,
+    url: `${base}/agents/${session_id}/a2a`,
+    humanReadableId: `calling-all-stations/${session_id}`,
+    version: '1.0.0',
+    capabilities: { streaming: false, pushNotifications: false },
+    skills,
+    defaultInputModes: ['application/json', 'text/plain'],
+    defaultOutputModes: ['application/json', 'text/plain'],
+    'x-proxy': {
+      coordinator: base,
+      session_id,
+      transport: 'mcp-push',
+      status: entry.status,
+      current_step: entry.current_step,
+    },
+  }
+}
+
+export function buildAgentDirectory() {
+  const base = getServerUrl()
+  return {
+    coordinator: `${base}/.well-known/agent-card.json`,
+    agents: Array.from(registry.values()).map(entry => ({
+      session_id: entry.session_id,
+      label: entry.label,
+      status: entry.status,
+      current_step: entry.current_step,
+      skills: Array.isArray(entry.skills) ? entry.skills.map(s => s.id) : [],
+      agent_card_url: `${base}/agents/${entry.session_id}/agent-card.json`,
+      a2a_url: `${base}/agents/${entry.session_id}/a2a`,
+    })),
+  }
+}
+
+export function buildSkillDirectory() {
+  const skillMap = new Map()
+  for (const entry of registry.values()) {
+    if (!Array.isArray(entry.skills)) continue
+    for (const skill of entry.skills) {
+      if (!skillMap.has(skill.id)) {
+        skillMap.set(skill.id, { ...skill, agents: [] })
+      }
+      skillMap.get(skill.id).agents.push({
+        session_id: entry.session_id,
+        label: entry.label,
+        status: entry.status,
+      })
+    }
+  }
+  return { skills: Array.from(skillMap.values()) }
+}
+
+// ---------------------------------------------------------------------------
+// A2A task management
+// ---------------------------------------------------------------------------
+
+const TASK_TTL_MS = 60 * 60 * 1000 // 1 hour
+
+export function createTask(sessionId, message) {
+  const id = crypto.randomUUID()
+  const task = {
+    id,
+    session_id: sessionId,
+    status: { state: 'submitted' },
+    message,
+    result: null,
+    artifacts: [],
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+  tasks.set(id, task)
+  return task
+}
+
+export function updateTask(taskId, patch) {
+  const task = tasks.get(taskId)
+  if (!task) return null
+  Object.assign(task, patch, { updated_at: new Date().toISOString() })
+  return task
+}
+
+export function getTask(taskId) {
+  return tasks.get(taskId) ?? null
+}
+
+export function pruneExpiredTasks() {
+  const cutoff = Date.now() - TASK_TTL_MS
+  for (const [id, task] of tasks) {
+    if (new Date(task.created_at).getTime() < cutoff) tasks.delete(id)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A2A JSON-RPC handler
+// ---------------------------------------------------------------------------
+
+let seq = 0
+
+export function handleA2aRequest(payload, sessionId, baseUrl) {
+  const { jsonrpc, id, method, params } = payload
+
+  if (jsonrpc !== '2.0') {
+    return { jsonrpc: '2.0', id: id ?? null, error: { code: -32600, message: 'Invalid Request' } }
+  }
+
+  if (method === 'tasks/get') {
+    const taskId = params?.taskId ?? params?.id
+    if (!taskId) {
+      return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing taskId' } }
+    }
+    const task = getTask(taskId)
+    if (!task) {
+      return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Task not found' } }
+    }
+    return { jsonrpc: '2.0', id, result: { task } }
+  }
+
+  if (method === 'message/send') {
+    const message = params?.message
+    if (!message) {
+      return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing message' } }
+    }
+
+    // If routing to a specific agent (per-agent proxy endpoint sets sessionId)
+    if (sessionId) {
+      if (!registry.has(sessionId)) {
+        return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Agent not found' } }
+      }
+      const task = createTask(sessionId, message)
+      const directive = {
+        id: crypto.randomUUID(),
+        type: 'a2a_message',
+        body: { task_id: task.id, message },
+        sent_at: new Date().toISOString(),
+        delivered: false,
+      }
+      if (!inboxes.has(sessionId)) inboxes.set(sessionId, [])
+      inboxes.get(sessionId).push(directive)
+      updateTask(task.id, { status: { state: 'working' } })
+      persistState()
+      process.stderr.write(`[switchboard] A2A task ${task.id.slice(0,8)} queued for agent ${sessionId.slice(0,8)}\n`)
+      return { jsonrpc: '2.0', id, result: { task } }
+    }
+
+    // Coordinator: extract skill or broadcast
+    const skill = params?.skill
+    const text = Array.isArray(message.parts)
+      ? message.parts.map(p => p.text ?? '').join(' ')
+      : (message.text ?? JSON.stringify(message))
+
+    if (skill) {
+      // Skill-based routing — find first running agent with that skill
+      const target = Array.from(registry.values()).find(
+        e => e.status === 'running' && Array.isArray(e.skills) && e.skills.some(s => s.id === skill)
+      )
+      if (!target) {
+        return { jsonrpc: '2.0', id, error: { code: -32001, message: `No running agent with skill: ${skill}` } }
+      }
+      const task = createTask(target.session_id, message)
+      const directive = {
+        id: crypto.randomUUID(),
+        type: 'a2a_message',
+        body: { task_id: task.id, message },
+        sent_at: new Date().toISOString(),
+        delivered: false,
+      }
+      if (!inboxes.has(target.session_id)) inboxes.set(target.session_id, [])
+      inboxes.get(target.session_id).push(directive)
+      updateTask(task.id, { status: { state: 'working' } })
+      persistState()
+      process.stderr.write(`[switchboard] A2A skill-routed task ${task.id.slice(0,8)} → ${target.session_id.slice(0,8)} (${skill})\n`)
+      return { jsonrpc: '2.0', id, result: { task } }
+    }
+
+    // Broadcast to all MCP sessions
+    const msgId = `m${Date.now()}-${++seq}`
+    broadcastNotification('notifications/message', {
+      content: text,
+      meta: { message_id: msgId, ts: new Date().toISOString(), event: 'a2a_broadcast', message },
+    })
+    const task = createTask('broadcast', message)
+    updateTask(task.id, { status: { state: 'completed' }, result: { message_id: msgId } })
+    process.stderr.write(`[switchboard] A2A broadcast ${msgId}\n`)
+    return { jsonrpc: '2.0', id, result: { task } }
+  }
+
+  return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } }
+}
+
+// ---------------------------------------------------------------------------
+// MCP session management
+// ---------------------------------------------------------------------------
+
+const mcpSessions = new Map()
+
+export function broadcastNotification(method, params) {
+  for (const [, { server }] of mcpSessions) {
+    try { server.notification({ method, params }) } catch {}
+  }
+}
+
 function createMcpServer() {
   const server = new Server(
-    { name: 'switchboard', version: '1.0.0' },
+    { name: 'calling-all-stations', version: '1.0.0' },
     {
       capabilities: { tools: {} },
-      instructions: `Switchboard is a multi-agent coordination server.
+      instructions: `Calling-all-stations is a multi-agent coordination server supporting MCP and A2A.
 
-When you receive a <channel source="switchboard"> notification:
-- event="agent_status": log the update; the sending agent has changed step.
-- event="agent_question": an agent needs an answer. Call send_directive with type="answer" immediately. If you cannot answer, escalate appropriately.
-- event="issue_complete": an agent has finished its task.
+When you receive a <channel source="calling-all-stations"> notification:
+- event="agent_status": log the update; the sending agent changed step.
+- event="agent_question": an agent needs an answer. Call send_directive with type="answer" immediately.
+- event="agent_response": an A2A task was completed by an agent. Mark the task done.
+- event="issue_complete": an agent finished its task.
+- event="a2a_broadcast": an external A2A agent sent a broadcast message.
 - event="ping": acknowledge and continue.
 
 Do not wait for the next scheduled tick — handle channel events immediately.`,
@@ -128,7 +405,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       },
       {
         name: 'send_directive',
-        description: 'Send a directive to another registered agent. The message lands in their inbox and is returned on their next check_inbox call.',
+        description: 'Send a directive to another registered agent. The message lands in their inbox on their next check_inbox call.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -141,7 +418,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       },
       {
         name: 'send',
-        description: 'Broadcast a status update or question to all connected MCP sessions. For agent_question events, another agent answers via send_directive and you poll check_inbox for the reply.',
+        description: 'Broadcast a status update or question to all connected MCP sessions.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -153,6 +430,29 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
             step:       { type: 'string', description: 'Current step label (updates your registry entry)' },
           },
           required: ['event', 'session_id'],
+        },
+      },
+      {
+        name: 'complete_task',
+        description: 'Complete an A2A task that was routed to you via check_inbox (type: a2a_message). Call this when you have finished processing the task.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            task_id:   { type: 'string', description: 'The task_id from the a2a_message directive body' },
+            result:    { type: 'object', description: 'Task result payload' },
+            artifacts: {
+              type: 'array',
+              description: 'Optional output artifacts',
+              items: {
+                type: 'object',
+                properties: {
+                  mimeType: { type: 'string' },
+                  data:     {},
+                },
+              },
+            },
+          },
+          required: ['task_id', 'result'],
         },
       },
     ],
@@ -202,18 +502,34 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
           entry.question_at = new Date().toISOString()
         }
       }
-      const id      = `m${Date.now()}-${++seq}`
+      const msgId = `m${Date.now()}-${++seq}`
       const content = message ?? question ?? `${eventType}:${session_id}`
       broadcastNotification('notifications/message', {
         content,
         meta: {
-          message_id: id, ts: new Date().toISOString(),
+          message_id: msgId, ts: new Date().toISOString(),
           event: eventType, session_id,
           question: question ?? null, blocking: blocking ?? false, step: step ?? null,
         },
       })
       process.stderr.write(`[switchboard] send event=${eventType} session=${session_id.slice(0,8)}\n`)
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, message_id: id }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, message_id: msgId }) }] }
+    }
+
+    if (name === 'complete_task') {
+      const { task_id, result, artifacts = [] } = args
+      const task = getTask(task_id)
+      if (!task) {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'task_not_found' }) }] }
+      }
+      updateTask(task_id, { status: { state: 'completed' }, result, artifacts })
+      process.stderr.write(`[switchboard] task completed: ${task_id.slice(0,8)}\n`)
+      // Broadcast task completion
+      broadcastNotification('notifications/message', {
+        content: `Task ${task_id.slice(0,8)} completed`,
+        meta: { message_id: `m${Date.now()}`, ts: new Date().toISOString(), event: 'agent_response', task_id, result },
+      })
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, task_id }) }] }
     }
 
     return { content: [{ type: 'text', text: JSON.stringify({ error: 'unknown tool' }) }], isError: true }
@@ -222,205 +538,303 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
   return server
 }
 
-// -- HTTP server -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// HTTP server
+// ---------------------------------------------------------------------------
 
-const httpServer = createServer(async (req, res) => {
+export function createAppServer() {
+  const httpServer = createServer(async (req, res) => {
 
-  // MCP Streamable HTTP endpoint
-  if (req.url === '/mcp') {
-    const sessionId = req.headers['mcp-session-id']
+    // MCP Streamable HTTP
+    if (req.url === '/mcp') {
+      const sessionId = req.headers['mcp-session-id']
 
-    if (req.method === 'POST') {
-      let body = ''
-      req.on('data', c => { body += c })
-      await new Promise(r => req.on('end', r))
-      let parsedBody
-      try { parsedBody = JSON.parse(body) } catch {}
+      if (req.method === 'POST') {
+        let body = ''
+        req.on('data', c => { body += c })
+        await new Promise(r => req.on('end', r))
+        let parsedBody
+        try { parsedBody = JSON.parse(body) } catch {}
 
-      if (sessionId && mcpSessions.has(sessionId)) {
-        await mcpSessions.get(sessionId).transport.handleRequest(req, res, parsedBody)
-      } else if (!sessionId) {
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => crypto.randomUUID(),
-          onsessioninitialized: (sid) => {
-            mcpSessions.set(sid, { transport, server: mcpServer })
-            process.stderr.write(`[switchboard] MCP session init: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
-          },
-        })
-        let mcpServer
-        transport.onclose = () => {
-          const sid = transport.sessionId
-          if (sid) {
-            mcpSessions.delete(sid)
-            process.stderr.write(`[switchboard] MCP session closed: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
+        if (sessionId && mcpSessions.has(sessionId)) {
+          await mcpSessions.get(sessionId).transport.handleRequest(req, res, parsedBody)
+        } else if (!sessionId) {
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => crypto.randomUUID(),
+            onsessioninitialized: (sid) => {
+              mcpSessions.set(sid, { transport, server: mcpServer })
+              process.stderr.write(`[switchboard] MCP session init: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
+            },
+          })
+          let mcpServer
+          transport.onclose = () => {
+            const sid = transport.sessionId
+            if (sid) {
+              mcpSessions.delete(sid)
+              process.stderr.write(`[switchboard] MCP session closed: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
+            }
+          }
+          mcpServer = createMcpServer()
+          await mcpServer.connect(transport)
+          await transport.handleRequest(req, res, parsedBody)
+        } else {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Unknown session ID' }))
+        }
+        return
+      }
+      if (req.method === 'GET') {
+        if (sessionId && mcpSessions.has(sessionId)) {
+          await mcpSessions.get(sessionId).transport.handleRequest(req, res)
+        } else {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Invalid or missing session ID' }))
+        }
+        return
+      }
+      if (req.method === 'DELETE') {
+        if (sessionId && mcpSessions.has(sessionId)) {
+          await mcpSessions.get(sessionId).transport.handleRequest(req, res)
+        } else {
+          res.writeHead(404); res.end()
+        }
+        return
+      }
+      res.writeHead(405); res.end('Method Not Allowed')
+      return
+    }
+
+    // A2A coordinator endpoint
+    if (req.url === '/a2a') {
+      if (req.method === 'POST') {
+        let body = ''
+        req.on('data', c => { body += c })
+        await new Promise(r => req.on('end', r))
+        let payload
+        try { payload = JSON.parse(body) } catch {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }))
+          return
+        }
+        const result = handleA2aRequest(payload, null, getServerUrl())
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+        return
+      }
+      res.writeHead(405); res.end('Method Not Allowed')
+      return
+    }
+
+    // A2A per-agent proxy endpoint
+    const agentA2aMatch = req.url.match(/^\/agents\/([^/]+)\/a2a$/)
+    if (agentA2aMatch) {
+      if (req.method === 'POST') {
+        const session_id = agentA2aMatch[1]
+        let body = ''
+        req.on('data', c => { body += c })
+        await new Promise(r => req.on('end', r))
+        let payload
+        try { payload = JSON.parse(body) } catch {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }))
+          return
+        }
+        const result = handleA2aRequest(payload, session_id, getServerUrl())
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+        return
+      }
+      res.writeHead(405); res.end('Method Not Allowed')
+      return
+    }
+
+    // A2A agent card — coordinator
+    if (req.method === 'GET' && req.url === '/.well-known/agent-card.json') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(buildCoordinatorCard(), null, 2))
+      return
+    }
+
+    // A2A agent directory
+    if (req.method === 'GET' && req.url === '/agents/') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(buildAgentDirectory(), null, 2))
+      return
+    }
+
+    // A2A per-agent card
+    const agentCardMatch = req.url.match(/^\/agents\/([^/]+)\/agent-card\.json$/)
+    if (req.method === 'GET' && agentCardMatch) {
+      const session_id = agentCardMatch[1]
+      const card = buildAgentCard(session_id)
+      if (!card) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'agent not found' })); return }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(card, null, 2))
+      return
+    }
+
+    // Health
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ status: 'ok', port: PORT, agents: registry.size, mcp_sessions: mcpSessions.size, tasks: tasks.size }))
+      return
+    }
+
+    // Registry
+    if (req.method === 'GET' && req.url === '/registry') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ agents: Object.fromEntries(registry) }))
+      return
+    }
+
+    // Skills directory
+    if (req.method === 'GET' && req.url === '/skills') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(buildSkillDirectory(), null, 2))
+      return
+    }
+
+    if (req.method !== 'POST') {
+      res.writeHead(405); res.end('Method Not Allowed'); return
+    }
+
+    // --- POST endpoints ---
+    let body = ''
+    req.on('data', chunk => { body += chunk })
+    req.on('end', () => {
+      let payload
+      try { payload = JSON.parse(body) } catch { payload = { message: body.trim() } }
+
+      if (req.url === '/register') {
+        const { session_id, issue_number, label, started_at, skills } = payload
+        if (session_id) {
+          registry.set(session_id, {
+            session_id,
+            issue_number: issue_number ?? null,
+            label: label ?? 'registered',
+            started_at: started_at ?? new Date().toISOString(),
+            status: 'running',
+            last_status_at: new Date().toISOString(),
+            current_step: 'starting',
+            skills: Array.isArray(skills) ? skills : [],
+          })
+          inboxes.set(session_id, [])
+          persistState()
+          process.stderr.write(`[switchboard] registered ${session_id.slice(0,8)}\n`)
+        }
+        res.writeHead(204); res.end(); return
+      }
+
+      if (req.url.startsWith('/deregister/')) {
+        const session_id = req.url.replace('/deregister/', '')
+        registry.delete(session_id)
+        inboxes.delete(session_id)
+        persistState()
+        process.stderr.write(`[switchboard] deregistered ${session_id.slice(0,8)}\n`)
+        res.writeHead(204); res.end(); return
+      }
+
+      if (req.url === '/check-inbox') {
+        const { session_id } = payload
+        autoRegister(session_id, 'HTTP /check-inbox')
+        const pending = (inboxes.get(session_id) ?? []).filter(d => !d.delivered)
+        for (const d of pending) d.delivered = true
+        process.stderr.write(`[switchboard] HTTP check-inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ directives: pending.map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at })) }))
+        return
+      }
+
+      if (req.url === '/send') {
+        const { event: eventType, session_id, message, question, blocking, step } = payload
+        if (session_id) autoRegister(session_id, `HTTP /send(${eventType})`)
+        const entry = session_id ? registry.get(session_id) : null
+        if (entry) {
+          if (step) { entry.current_step = step; entry.last_status_at = new Date().toISOString() }
+          if (eventType === 'agent_question' && blocking) {
+            entry.waiting_for_answer = true
+            entry.question    = question ?? null
+            entry.question_at = new Date().toISOString()
           }
         }
-        mcpServer = createMcpServer()
-        await mcpServer.connect(transport)
-        await transport.handleRequest(req, res, parsedBody)
-      } else {
-        res.writeHead(400, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Unknown session ID' }))
-      }
-      return
-    }
-
-    if (req.method === 'GET') {
-      if (sessionId && mcpSessions.has(sessionId)) {
-        await mcpSessions.get(sessionId).transport.handleRequest(req, res)
-      } else {
-        res.writeHead(400, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Invalid or missing session ID' }))
-      }
-      return
-    }
-
-    if (req.method === 'DELETE') {
-      if (sessionId && mcpSessions.has(sessionId)) {
-        await mcpSessions.get(sessionId).transport.handleRequest(req, res)
-      } else {
-        res.writeHead(404); res.end()
-      }
-      return
-    }
-
-    res.writeHead(405); res.end('Method Not Allowed')
-    return
-  }
-
-  // Health
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ status: 'ok', port: PORT, agents: registry.size, mcp_sessions: mcpSessions.size }))
-    return
-  }
-
-  // Registry
-  if (req.method === 'GET' && req.url === '/registry') {
-    res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ agents: Object.fromEntries(registry) }))
-    return
-  }
-
-  if (req.method !== 'POST') {
-    res.writeHead(405); res.end('Method Not Allowed'); return
-  }
-
-  let body = ''
-  req.on('data', chunk => { body += chunk })
-  req.on('end', () => {
-    let payload
-    try { payload = JSON.parse(body) } catch { payload = { message: body.trim() } }
-
-    if (req.url === '/register') {
-      const { session_id, issue_number, label, started_at } = payload
-      if (session_id) {
-        registry.set(session_id, {
-          session_id, issue_number: issue_number ?? null, label: label ?? 'registered',
-          started_at: started_at ?? new Date().toISOString(),
-          status: 'running', last_status_at: new Date().toISOString(), current_step: 'starting',
+        const msgId = `m${Date.now()}-${++seq}`
+        const content = message ?? question ?? `${eventType}:${session_id}`
+        broadcastNotification('notifications/message', {
+          content,
+          meta: {
+            message_id: msgId, ts: new Date().toISOString(),
+            event: eventType, session_id,
+            question: question ?? null, blocking: blocking ?? false, step: step ?? null,
+          },
         })
-        inboxes.set(session_id, [])
-        persistState()
-        process.stderr.write(`[switchboard] registered ${session_id.slice(0,8)}\n`)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, message_id: msgId }))
+        process.stderr.write(`[switchboard] HTTP send event=${eventType} session=${session_id?.slice(0,8)}\n`)
+        return
       }
-      res.writeHead(204); res.end(); return
-    }
 
-    if (req.url.startsWith('/deregister/')) {
-      const session_id = req.url.replace('/deregister/', '')
-      registry.delete(session_id)
-      inboxes.delete(session_id)
-      persistState()
-      process.stderr.write(`[switchboard] deregistered ${session_id.slice(0,8)}\n`)
-      res.writeHead(204); res.end(); return
-    }
-
-    if (req.url === '/check-inbox') {
-      const { session_id } = payload
-      autoRegister(session_id, 'HTTP /check-inbox')
-      const pending = (inboxes.get(session_id) ?? []).filter(d => !d.delivered)
-      for (const d of pending) d.delivered = true
-      process.stderr.write(`[switchboard] HTTP check-inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ directives: pending.map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at })) }))
-      return
-    }
-
-    if (req.url === '/send') {
-      const { event: eventType, session_id, message, question, blocking, step } = payload
-      if (session_id) autoRegister(session_id, `HTTP /send(${eventType})`)
-      const entry = session_id ? registry.get(session_id) : null
-      if (entry) {
-        if (step) { entry.current_step = step; entry.last_status_at = new Date().toISOString() }
-        if (eventType === 'agent_question' && blocking) {
-          entry.waiting_for_answer = true
-          entry.question    = question ?? null
-          entry.question_at = new Date().toISOString()
+      if (req.url === '/send-directive') {
+        const { session_id, type, body: directiveBody } = payload
+        if (!session_id || !type || !directiveBody) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: 'missing session_id, type, or body' })); return
         }
+        if (!registry.has(session_id)) {
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: 'session_not_found' })); return
+        }
+        const directive = { id: crypto.randomUUID(), type, body: directiveBody, sent_at: new Date().toISOString(), delivered: false }
+        if (!inboxes.has(session_id)) inboxes.set(session_id, [])
+        inboxes.get(session_id).push(directive)
+        if (type === 'answer') {
+          const entry = registry.get(session_id)
+          if (entry) { entry.waiting_for_answer = false; entry.last_status_at = new Date().toISOString() }
+        }
+        persistState()
+        process.stderr.write(`[switchboard] HTTP send-directive -> ${session_id.slice(0,8)}: ${type}\n`)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, directive_id: directive.id }))
+        return
       }
-      const id      = `m${Date.now()}-${++seq}`
-      const content = message ?? question ?? `${eventType}:${session_id}`
+
+      if (req.url === '/status') {
+        const { session_id, step } = payload
+        if (session_id && registry.has(session_id)) {
+          const entry = registry.get(session_id)
+          entry.current_step = step
+          entry.last_status_at = new Date().toISOString()
+        }
+        res.writeHead(204); res.end(); return
+      }
+
+      // Default: broadcast notification
+      const msgId = `m${Date.now()}-${++seq}`
+      const content = payload.message ?? JSON.stringify(payload)
       broadcastNotification('notifications/message', {
         content,
-        meta: {
-          message_id: id, ts: new Date().toISOString(),
-          event: eventType, session_id,
-          question: question ?? null, blocking: blocking ?? false, step: step ?? null,
-        },
+        meta: { message_id: msgId, ts: new Date().toISOString(), event: payload.event ?? 'message', ...payload },
       })
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, message_id: id }))
-      process.stderr.write(`[switchboard] HTTP send event=${eventType} session=${session_id?.slice(0,8)}\n`)
-      return
-    }
-
-    if (req.url === '/send-directive') {
-      const { session_id, type, body: directiveBody } = payload
-      if (!session_id || !type || !directiveBody) {
-        res.writeHead(400, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ ok: false, error: 'missing session_id, type, or body' })); return
-      }
-      if (!registry.has(session_id)) {
-        res.writeHead(404, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ ok: false, error: 'session_not_found' })); return
-      }
-      const directive = { id: crypto.randomUUID(), type, body: directiveBody, sent_at: new Date().toISOString(), delivered: false }
-      if (!inboxes.has(session_id)) inboxes.set(session_id, [])
-      inboxes.get(session_id).push(directive)
-      if (type === 'answer') {
-        const entry = registry.get(session_id)
-        if (entry) { entry.waiting_for_answer = false; entry.last_status_at = new Date().toISOString() }
-      }
-      persistState()
-      process.stderr.write(`[switchboard] HTTP send-directive -> ${session_id.slice(0,8)}: ${type}\n`)
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, directive_id: directive.id }))
-      return
-    }
-
-    if (req.url === '/status') {
-      const { session_id, step } = payload
-      if (session_id && registry.has(session_id)) {
-        const entry = registry.get(session_id)
-        entry.current_step = step
-        entry.last_status_at = new Date().toISOString()
-      }
-      res.writeHead(204); res.end(); return
-    }
-
-    // Default: broadcast notification
-    const id      = `m${Date.now()}-${++seq}`
-    const content = payload.message ?? JSON.stringify(payload)
-    broadcastNotification('notifications/message', {
-      content,
-      meta: { message_id: id, ts: new Date().toISOString(), event: payload.event ?? 'message', ...payload },
+      res.writeHead(204); res.end()
+      process.stderr.write(`[switchboard] broadcast: ${content.slice(0, 120)}\n`)
     })
-    res.writeHead(204); res.end()
-    process.stderr.write(`[switchboard] broadcast: ${content.slice(0, 120)}\n`)
   })
-})
 
-httpServer.listen(PORT, BIND_HOST, () => {
-  process.stderr.write(`[switchboard] v1.0.0 listening on ${BIND_HOST}:${PORT} — MCP at /mcp\n`)
-})
+  return httpServer
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+// Only start listening when run directly (not imported by tests)
+if (process.argv[1] === new URL(import.meta.url).pathname) {
+  hydrateState()
+  setInterval(persistState, 30_000)
+  setInterval(pruneExpiredTasks, 5 * 60 * 1000)
+
+  const httpServer = createAppServer()
+  httpServer.listen(PORT, BIND_HOST, () => {
+    process.stderr.write(`[switchboard] v1.1.0 listening on ${BIND_HOST}:${PORT}\n`)
+    process.stderr.write(`[switchboard] MCP at /mcp | A2A at /a2a | Cards at /.well-known/agent-card.json\n`)
+  })
+}

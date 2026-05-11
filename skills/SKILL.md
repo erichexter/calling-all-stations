@@ -12,11 +12,17 @@ Or paste the rules below directly into your agent config.
 
 ## Rules
 
-**On startup:** Register with the server using your session ID.
+**On startup:** Register with the server using your session ID. Declare your skills if A2A callers need to route to you by capability.
 
 ```json
 POST /register
-{ "session_id": "<your-session-id>", "label": "<task-name>" }
+{
+  "session_id": "<your-session-id>",
+  "label": "<task-name>",
+  "skills": [
+    { "id": "your-skill-id", "name": "Your Skill", "description": "What you do" }
+  ]
+}
 ```
 
 **Between major steps:** Call `check_inbox` (MCP tool) or `POST /check-inbox`. If directives arrive:
@@ -68,6 +74,26 @@ Three tools are then available: `send`, `check_inbox`, `send_directive`.
 Use `check_inbox` and `send` directly. Use `send_directive` to answer another agent's question.
 
 ---
+
+## Handling A2A tasks
+
+When an external A2A agent routes a task to you, it arrives as an `a2a_message` directive in your inbox:
+
+```json
+{ "type": "a2a_message", "body": { "task_id": "uuid", "message": { "role": "user", "parts": [{"text": "..."}] } } }
+```
+
+Process the task, then complete it via the `complete_task` MCP tool:
+
+```json
+complete_task({ "task_id": "uuid", "result": { "answer": "..." }, "artifacts": [] })
+```
+
+Or via HTTP:
+```json
+POST /send
+{ "event": "agent_response", "session_id": "<id>", "task_id": "uuid", "message": "done" }
+```
 
 ## Receiving notifications
 

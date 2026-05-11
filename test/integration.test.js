@@ -1,0 +1,368 @@
+/**
+ * Integration tests — spins up real HTTP server, hits all endpoints.
+ * Run: node --test test/integration.test.js
+ */
+
+import { test, describe, before, after, beforeEach } from 'node:test'
+import assert from 'node:assert/strict'
+import { createAppServer, registry, inboxes, tasks } from '../server.js'
+
+// Helpers
+async function post(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const text = await res.text()
+  let json = null
+  try { json = JSON.parse(text) } catch {}
+  return { status: res.status, json, text }
+}
+
+async function get(url) {
+  const res = await fetch(url)
+  const text = await res.text()
+  let json = null
+  try { json = JSON.parse(text) } catch {}
+  return { status: res.status, json, text }
+}
+
+// ---------------------------------------------------------------------------
+let server
+let base
+let port
+
+before(async () => {
+  // Use random port to avoid conflicts
+  port = 19000 + Math.floor(Math.random() * 1000)
+  process.env.PORT = String(port)
+  process.env.SERVER_URL = `http://localhost:${port}`
+  process.env.STATE_FILE = `/tmp/switchboard-test-${port}.json`
+
+  server = createAppServer()
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve))
+  base = `http://127.0.0.1:${port}`
+})
+
+after(async () => {
+  await new Promise(resolve => server.close(resolve))
+  delete process.env.PORT
+  delete process.env.SERVER_URL
+  delete process.env.STATE_FILE
+})
+
+beforeEach(() => {
+  registry.clear()
+  inboxes.clear()
+  tasks.clear()
+})
+
+// ---------------------------------------------------------------------------
+describe('GET /health', () => {
+  test('returns ok with agent and task counts', async () => {
+    const { status, json } = await get(`${base}/health`)
+    assert.equal(status, 200)
+    assert.equal(json.status, 'ok')
+    assert.equal(typeof json.agents, 'number')
+    assert.equal(typeof json.tasks, 'number')
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('POST /register', () => {
+  test('registers an agent with no skills', async () => {
+    const { status } = await post(`${base}/register`, { session_id: 'test-1', label: 'Test Agent' })
+    assert.equal(status, 204)
+    assert.ok(registry.has('test-1'))
+    assert.deepEqual(registry.get('test-1').skills, [])
+  })
+
+  test('registers an agent with declared skills', async () => {
+    const skills = [{ id: 'coder', name: 'Coder', description: 'Writes code' }]
+    const { status } = await post(`${base}/register`, { session_id: 'test-2', label: 'Coder Agent', skills })
+    assert.equal(status, 204)
+    assert.deepEqual(registry.get('test-2').skills, skills)
+  })
+
+  test('ignores invalid skills value (non-array)', async () => {
+    await post(`${base}/register`, { session_id: 'test-3', skills: 'not-an-array' })
+    assert.deepEqual(registry.get('test-3').skills, [])
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('GET /.well-known/agent-card.json', () => {
+  test('returns coordinator agent card', async () => {
+    const { status, json } = await get(`${base}/.well-known/agent-card.json`)
+    assert.equal(status, 200)
+    assert.equal(json.protocolVersion, '1.0')
+    assert.equal(json.name, 'calling-all-stations')
+    assert.ok(json.url.includes('/a2a'))
+    assert.ok(Array.isArray(json.skills))
+    assert.ok(json.skills.some(s => s.id === 'broadcast'))
+    assert.ok(json.skills.some(s => s.id === 'route-directive'))
+    assert.ok(json.skills.some(s => s.id === 'query-registry'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('GET /agents/', () => {
+  test('returns empty directory when no agents', async () => {
+    const { status, json } = await get(`${base}/agents/`)
+    assert.equal(status, 200)
+    assert.ok(Array.isArray(json.agents))
+    assert.equal(json.agents.length, 0)
+    assert.ok(json.coordinator)
+  })
+
+  test('lists registered agents with card URLs', async () => {
+    await post(`${base}/register`, {
+      session_id: 'ag-1', label: 'Agent One',
+      skills: [{ id: 'tester', name: 'Tester' }],
+    })
+    await post(`${base}/register`, { session_id: 'ag-2', label: 'Agent Two' })
+    const { json } = await get(`${base}/agents/`)
+    assert.equal(json.agents.length, 2)
+    const ag1 = json.agents.find(a => a.session_id === 'ag-1')
+    assert.ok(ag1.agent_card_url.includes('ag-1'))
+    assert.ok(ag1.a2a_url.includes('ag-1'))
+    assert.deepEqual(ag1.skills, ['tester'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('GET /agents/:id/agent-card.json', () => {
+  test('returns 404 for unknown agent', async () => {
+    const { status } = await get(`${base}/agents/no-such/agent-card.json`)
+    assert.equal(status, 404)
+  })
+
+  test('returns card with declared skills', async () => {
+    const skills = [{ id: 'builder', name: 'Builder', description: 'Builds things' }]
+    await post(`${base}/register`, { session_id: 'card-1', label: 'Builder Bot', skills })
+    const { status, json } = await get(`${base}/agents/card-1/agent-card.json`)
+    assert.equal(status, 200)
+    assert.equal(json.name, 'Builder Bot')
+    assert.deepEqual(json.skills, skills)
+    assert.ok(json.url.includes('/agents/card-1/a2a'))
+    assert.equal(json['x-proxy'].session_id, 'card-1')
+    assert.equal(json['x-proxy'].transport, 'mcp-push')
+  })
+
+  test('returns generic skill when none declared', async () => {
+    await post(`${base}/register`, { session_id: 'card-2', label: 'Plain Agent' })
+    const { json } = await get(`${base}/agents/card-2/agent-card.json`)
+    assert.equal(json.skills.length, 1)
+    assert.equal(json.skills[0].id, 'general')
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('GET /skills', () => {
+  test('returns empty skills when no agents have skills', async () => {
+    await post(`${base}/register`, { session_id: 's1', label: 'No Skills' })
+    const { json } = await get(`${base}/skills`)
+    assert.deepEqual(json.skills, [])
+  })
+
+  test('aggregates skills across agents', async () => {
+    await post(`${base}/register`, {
+      session_id: 'sk-1', label: 'A',
+      skills: [{ id: 'coder', name: 'Coder' }, { id: 'reviewer', name: 'Reviewer' }],
+    })
+    await post(`${base}/register`, {
+      session_id: 'sk-2', label: 'B',
+      skills: [{ id: 'coder', name: 'Coder' }],
+    })
+    const { json } = await get(`${base}/skills`)
+    assert.equal(json.skills.length, 2)
+    const coder = json.skills.find(s => s.id === 'coder')
+    assert.equal(coder.agents.length, 2)
+    const reviewer = json.skills.find(s => s.id === 'reviewer')
+    assert.equal(reviewer.agents.length, 1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('POST /a2a — coordinator', () => {
+  test('returns error for invalid jsonrpc', async () => {
+    const { json } = await post(`${base}/a2a`, { jsonrpc: '1.0', id: 1, method: 'tasks/get', params: {} })
+    assert.equal(json.error.code, -32600)
+  })
+
+  test('tasks/get returns error for unknown task', async () => {
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'tasks/get', params: { taskId: 'no-such' },
+    })
+    assert.equal(json.error.code, -32001)
+  })
+
+  test('message/send broadcasts when no session_id and no skill', async () => {
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 1,
+      method: 'message/send',
+      params: { message: { role: 'user', parts: [{ text: 'hello all' }] } },
+    })
+    assert.ok(!json.error, JSON.stringify(json.error))
+    assert.equal(json.result.task.status.state, 'completed')
+  })
+
+  test('message/send with skill routes to matching agent', async () => {
+    await post(`${base}/register`, {
+      session_id: 'a2a-agent-1',
+      label: 'Skill Agent',
+      skills: [{ id: 'analyzer', name: 'Analyzer' }],
+    })
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2,
+      method: 'message/send',
+      params: { skill: 'analyzer', message: { parts: [{ text: 'analyze this' }] } },
+    })
+    assert.ok(!json.error)
+    assert.equal(json.result.task.session_id, 'a2a-agent-1')
+    assert.equal(json.result.task.status.state, 'working')
+    // Verify directive landed in inbox
+    const inbox = inboxes.get('a2a-agent-1') ?? []
+    assert.ok(inbox.some(d => d.type === 'a2a_message'))
+  })
+
+  test('message/send with skill returns error when no match', async () => {
+    const { json } = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 3,
+      method: 'message/send',
+      params: { skill: 'nonexistent-skill', message: { parts: [{ text: 'x' }] } },
+    })
+    assert.equal(json.error.code, -32001)
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('POST /agents/:id/a2a — per-agent proxy', () => {
+  test('returns 200 with error for unknown agent', async () => {
+    const { status, json } = await post(`${base}/agents/no-such/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'message/send',
+      params: { message: { parts: [{ text: 'hi' }] } },
+    })
+    assert.equal(status, 200) // A2A always 200
+    assert.equal(json.error.code, -32001)
+  })
+
+  test('routes message to agent inbox and creates task', async () => {
+    await post(`${base}/register`, { session_id: 'proxy-1', label: 'Proxy Target' })
+    const { json } = await post(`${base}/agents/proxy-1/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'message/send',
+      params: { message: { role: 'user', parts: [{ text: 'do the thing' }] } },
+    })
+    assert.ok(!json.error)
+    assert.equal(json.result.task.status.state, 'working')
+    // Verify agent can receive via check-inbox
+    const inbox = await post(`${base}/check-inbox`, { session_id: 'proxy-1' })
+    assert.equal(inbox.json.directives.length, 1)
+    assert.equal(inbox.json.directives[0].type, 'a2a_message')
+    assert.equal(inbox.json.directives[0].body.task_id, json.result.task.id)
+  })
+
+  test('tasks/get returns task status after message/send', async () => {
+    await post(`${base}/register`, { session_id: 'proxy-2', label: 'P2' })
+    const send = await post(`${base}/agents/proxy-2/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'message/send',
+      params: { message: { parts: [{ text: 'query' }] } },
+    })
+    const taskId = send.json.result.task.id
+    const get_ = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'tasks/get', params: { taskId },
+    })
+    assert.equal(get_.json.result.task.id, taskId)
+    assert.equal(get_.json.result.task.status.state, 'working')
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('Full A2A round-trip', () => {
+  test('agent receives a2a_message and completes task via send-directive', async () => {
+    // 1. Register agent
+    await post(`${base}/register`, {
+      session_id: 'rt-agent',
+      label: 'Round-trip Agent',
+      skills: [{ id: 'echo', name: 'Echo' }],
+    })
+
+    // 2. External A2A caller sends message to agent
+    const send = await post(`${base}/agents/rt-agent/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'message/send',
+      params: { message: { role: 'user', parts: [{ text: 'echo: hello' }] } },
+    })
+    assert.ok(!send.json.error)
+    const taskId = send.json.result.task.id
+    assert.equal(send.json.result.task.status.state, 'working')
+
+    // 3. Agent polls check-inbox, finds the a2a_message directive
+    const inbox = await post(`${base}/check-inbox`, { session_id: 'rt-agent' })
+    assert.equal(inbox.json.directives.length, 1)
+    const directive = inbox.json.directives[0]
+    assert.equal(directive.type, 'a2a_message')
+    assert.equal(directive.body.task_id, taskId)
+
+    // 4. Agent simulates completing the task via send-directive (answer type)
+    // In real usage: agent calls complete_task MCP tool
+    // Here we directly update the task to simulate completion
+    const { updateTask: ut } = await import('../server.js')
+    ut(taskId, { status: { state: 'completed' }, result: { echo: 'hello' } })
+
+    // 5. Verify task is now completed
+    const check = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 2, method: 'tasks/get', params: { taskId },
+    })
+    assert.equal(check.json.result.task.status.state, 'completed')
+    assert.deepEqual(check.json.result.task.result, { echo: 'hello' })
+  })
+
+  test('skill-based round-trip — coordinator routes to correct agent', async () => {
+    // Register two agents, only one has the skill
+    await post(`${base}/register`, { session_id: 'no-skill', label: 'No Skill' })
+    await post(`${base}/register`, {
+      session_id: 'has-skill',
+      label: 'Has Skill',
+      skills: [{ id: 'summarizer', name: 'Summarizer' }],
+    })
+
+    // Send via coordinator with skill hint
+    const send = await post(`${base}/a2a`, {
+      jsonrpc: '2.0', id: 1, method: 'message/send',
+      params: {
+        skill: 'summarizer',
+        message: { role: 'user', parts: [{ text: 'summarize this document' }] },
+      },
+    })
+    assert.ok(!send.json.error)
+    assert.equal(send.json.result.task.session_id, 'has-skill')
+
+    // Verify directive in correct inbox only
+    const skilled = inboxes.get('has-skill') ?? []
+    const noSkill = inboxes.get('no-skill') ?? []
+    assert.equal(skilled.filter(d => d.type === 'a2a_message').length, 1)
+    assert.equal(noSkill.filter(d => d.type === 'a2a_message').length, 0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('Existing REST endpoints still work', () => {
+  test('POST /register → POST /check-inbox → POST /send-directive round-trip', async () => {
+    await post(`${base}/register`, { session_id: 'rest-1', label: 'REST Agent' })
+    await post(`${base}/send-directive`, {
+      session_id: 'rest-1', type: 'message', body: { text: 'hello' },
+    })
+    const inbox = await post(`${base}/check-inbox`, { session_id: 'rest-1' })
+    assert.equal(inbox.json.directives.length, 1)
+    assert.equal(inbox.json.directives[0].body.text, 'hello')
+  })
+
+  test('GET /registry returns all agents', async () => {
+    await post(`${base}/register`, { session_id: 'reg-1', label: 'R1' })
+    await post(`${base}/register`, { session_id: 'reg-2', label: 'R2' })
+    const { json } = await get(`${base}/registry`)
+    assert.ok(json.agents['reg-1'])
+    assert.ok(json.agents['reg-2'])
+  })
+})

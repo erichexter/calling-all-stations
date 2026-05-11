@@ -1,17 +1,29 @@
 # calling-all-stations
 
-A lightweight multi-agent coordination server built on [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http).
+A lightweight multi-agent coordination server supporting both [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) and the [Agent-to-Agent (A2A) protocol v1.0](https://a2a-protocol.org/).
 
-Agents register, broadcast events, ask questions, and receive directed replies through a shared registry and inbox system. Claude agents connect via MCP — any other runtime connects via the REST API.
+Agents register, broadcast events, ask questions, and receive directed replies through a shared registry and inbox system. Claude agents connect via MCP. LangGraph, Bedrock, Vertex AI, and other A2A-compatible runtimes connect via A2A. Any other agent connects via REST.
+
+```
+┌─ calling-all-stations ──────────────────────────────────────┐
+│  Registry  │  Inbox/Directives  │  Task Store  │  Broadcast │
+├─────────────────────────────────────────────────────────────┤
+│  MCP Streamable HTTP  │  A2A JSON-RPC 2.0  │  REST HTTP    │
+│  (Claude, MCP agents) │  (LangGraph, etc.) │  (any client) │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## What it does
 
-- **Registry** — agents announce themselves and their current step
+- **Registry** — agents announce themselves, their status, and their declared skills
 - **Inbox** — directed messages queue per-agent and are returned on next `check_inbox`
 - **Broadcast** — push notifications to all connected MCP sessions instantly
-- **Agent Q&A** — agent asks a question (`agent_question`), another agent (or human operator) answers via `send_directive`, asker polls `check_inbox` for the reply
+- **Agent Q&A** — agent asks a question, operator/orchestrator answers via `send_directive`
+- **A2A tasks** — external A2A agents send tasks via standard JSON-RPC 2.0; tasks are routed to registered agents via MCP push and tracked through completion
+- **Skill routing** — A2A callers can route by skill ID; the server finds the first available agent with that skill
+- **Agent Cards** — auto-generated A2A agent cards for the coordinator and each registered agent
 
 ```
 Agent A ──send(agent_question)──► switchboard ──broadcast──► Agent B / operator
@@ -26,6 +38,36 @@ node server.js
 ```
 
 Server starts on `http://0.0.0.0:8788`.
+
+### Connect via A2A
+
+Any A2A-compatible runtime (LangGraph, AWS Bedrock AgentCore, Google Vertex AI, Azure AI, Strands) can interact without MCP:
+
+```bash
+# Discover coordinator capabilities
+curl http://localhost:8788/.well-known/agent-card.json
+
+# List all registered agents
+curl http://localhost:8788/agents/
+
+# See all declared skills across agents
+curl http://localhost:8788/skills
+
+# Send a task to a specific agent
+curl -X POST http://localhost:8788/agents/<session_id>/a2a \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"your task here"}]}}}'
+
+# Route by skill (coordinator picks the right agent)
+curl -X POST http://localhost:8788/a2a \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"skill":"code-review","message":{"parts":[{"text":"review this PR"}]}}}'
+
+# Poll task status
+curl -X POST http://localhost:8788/a2a \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"taskId":"<task-id>"}}'
+```
 
 ### Connect via MCP (Claude Code)
 
@@ -47,6 +89,41 @@ Three MCP tools become available: `send`, `check_inbox`, `send_directive`.
 ### Connect via REST (any agent)
 
 No MCP required — use the HTTP endpoints directly.
+
+### Register with skills (for A2A routing)
+
+Declare your agent's skills on registration so A2A callers can route to you by capability:
+
+```json
+POST /register
+{
+  "session_id": "your-uuid",
+  "label": "My Agent",
+  "skills": [
+    {
+      "id": "code-review",
+      "name": "Code Reviewer",
+      "description": "Reviews pull requests and suggests improvements",
+      "inputModes": ["text/plain", "application/json"],
+      "outputModes": ["text/plain", "application/json"]
+    }
+  ]
+}
+```
+
+Once registered, your agent gets an auto-generated A2A card at `/agents/<session_id>/agent-card.json` and appears in the `/skills` directory.
+
+### Completing an A2A task
+
+When you receive a directive with `type: "a2a_message"` via `check_inbox`, process it and call `complete_task` MCP tool (or `POST /send` with `event=agent_response`) to mark it done:
+
+```json
+// check_inbox returns:
+{ "directives": [{ "type": "a2a_message", "body": { "task_id": "uuid", "message": {...} } }] }
+
+// Complete via MCP tool:
+complete_task({ "task_id": "uuid", "result": { "answer": "..." } })
+```
 
 ### Agent skill
 
@@ -113,6 +190,23 @@ $action = New-ScheduledTaskAction -Execute "node.exe" `
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 Register-ScheduledTask -TaskName "CallingAllStations" -Action $action -Trigger $trigger -RunLevel Highest
 ```
+
+---
+
+## A2A Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/.well-known/agent-card.json` | Coordinator agent card (A2A discovery) |
+| GET | `/agents/` | Directory of all registered agents with card URLs |
+| GET | `/agents/:id/agent-card.json` | Per-agent proxy card (auto-generated from registry) |
+| GET | `/skills` | Aggregated skill directory across all registered agents |
+| POST | `/a2a` | Coordinator A2A endpoint (broadcast or skill-route) |
+| POST | `/agents/:id/a2a` | Per-agent proxy A2A endpoint (routes to specific agent) |
+
+**A2A JSON-RPC methods:** `message/send`, `tasks/get`
+
+All A2A endpoints return HTTP 200 with JSON-RPC 2.0 responses (errors in the payload, not the HTTP status).
 
 ---
 
