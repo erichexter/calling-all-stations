@@ -80,7 +80,7 @@ Use `check_inbox` and `send` directly. Use `send_directive` to answer another ag
 When an external A2A agent routes a task to you, it arrives as an `a2a_message` directive in your inbox:
 
 ```json
-{ "type": "a2a_message", "body": { "task_id": "uuid", "message": { "role": "user", "parts": [{"text": "..."}] } } }
+{ "type": "a2a_message", "body": { "task_id": "uuid", "message": { "role": "user", "parts": [{"kind": "text", "text": "..."}] } } }
 ```
 
 Process the task, then complete it via the `complete_task` MCP tool:
@@ -89,11 +89,20 @@ Process the task, then complete it via the `complete_task` MCP tool:
 complete_task({ "task_id": "uuid", "result": { "answer": "..." }, "artifacts": [] })
 ```
 
+To fail a task (agent encountered an error):
+```json
+complete_task({ "task_id": "uuid", "error": { "code": -32000, "message": "could not process" } })
+```
+
 Or via HTTP:
 ```json
 POST /send
 { "event": "agent_response", "session_id": "<id>", "task_id": "uuid", "message": "done" }
 ```
+
+**Task states:** `submitted` → `working` → `completed` | `failed` | `canceled`
+
+**Part schema** (A2A v1.0): `{ kind: "text"|"raw"|"url"|"data", text|raw|url|data, mediaType?, filename? }`
 
 ## Receiving notifications
 

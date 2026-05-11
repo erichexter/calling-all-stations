@@ -56,17 +56,32 @@ curl http://localhost:8788/skills
 # Send a task to a specific agent
 curl -X POST http://localhost:8788/agents/<session_id>/a2a \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"your task here"}]}}}'
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"sendMessage","params":{"message":{"role":"user","parts":[{"kind":"text","text":"your task here"}]}}}'
 
 # Route by skill (coordinator picks the right agent)
 curl -X POST http://localhost:8788/a2a \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"skill":"code-review","message":{"parts":[{"text":"review this PR"}]}}}'
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"sendMessage","params":{"skill":"code-review","message":{"parts":[{"kind":"text","text":"review this PR"}]}}}'
 
 # Poll task status
 curl -X POST http://localhost:8788/a2a \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"taskId":"<task-id>"}}'
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"getTask","params":{"taskId":"<task-id>"}}'
+
+# Cancel a task
+curl -X POST http://localhost:8788/a2a \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"cancelTask","params":{"taskId":"<task-id>"}}'
+
+# List tasks (filter by contextId or status)
+curl -X POST http://localhost:8788/a2a \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":4,"method":"listTasks","params":{"contextId":"<ctx-id>","status":"working"}}'
 ```
 
 ### Connect via MCP (Claude Code)
@@ -204,9 +219,26 @@ Register-ScheduledTask -TaskName "CallingAllStations" -Action $action -Trigger $
 | POST | `/a2a` | Coordinator A2A endpoint (broadcast or skill-route) |
 | POST | `/agents/:id/a2a` | Per-agent proxy A2A endpoint (routes to specific agent) |
 
-**A2A JSON-RPC methods:** `message/send`, `tasks/get`
+**A2A JSON-RPC methods (spec-compliant names):**
 
-All A2A endpoints return HTTP 200 with JSON-RPC 2.0 responses (errors in the payload, not the HTTP status).
+| Method | Alias | Description |
+|---|---|---|
+| `sendMessage` | `message/send` | Send a task to an agent or broadcast |
+| `sendStreamingMessage` | `message/stream` | Send and stream status via SSE |
+| `getTask` | `tasks/get` | Poll task status by taskId |
+| `cancelTask` | — | Cancel a non-terminal task |
+| `listTasks` | — | List tasks, filter by contextId / status |
+
+All A2A endpoints return HTTP 200 with JSON-RPC 2.0 responses (errors in the payload, not the HTTP status). Every response includes an `A2A-Version: 1.0` header. Pass `A2A-Version: 1.0` on requests for strict version validation.
+
+**Task states:** `submitted` → `working` → `completed` | `failed` | `canceled` | `input_required` | `rejected` | `auth_required`
+
+**Part schema** (A2A v1.0): `{ kind: "text"|"raw"|"url"|"data", text|raw|url|data, mediaType?, filename? }`  
+Legacy `{ text: "..." }` is accepted and auto-upgraded.
+
+**Artifact schema**: `{ artifactId, name, description, parts[], metadata? }`
+
+**contextId**: Groups related tasks in a conversation. Auto-generated per task unless provided by the caller in `params.contextId`.
 
 ---
 
