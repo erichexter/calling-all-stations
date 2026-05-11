@@ -1,0 +1,26 @@
+{
+  "registry": {
+    "reg-1": {
+      "session_id": "reg-1",
+      "issue_number": null,
+      "label": "R1",
+      "started_at": "2026-05-11T18:05:32.437Z",
+      "status": "running",
+      "last_status_at": "2026-05-11T18:05:32.437Z",
+      "current_step": "starting",
+      "skills": []
+    },
+    "reg-2": {
+      "session_id": "reg-2",
+      "issue_number": null,
+      "label": "R2",
+      "started_at": "2026-05-11T18:05:32.437Z",
+      "status": "running",
+      "last_status_at": "2026-05-11T18:05:32.437Z",
+      "current_step": "starting",
+      "skills": []
+    }
+  },
+  "inboxes": {},
+  "ts": "2026-05-11T18:05:32.437Z"
+}

@@ -23,7 +23,7 @@
  * Configuration (env vars):
  *   PORT        — HTTP port (default: 8788)
  *   BIND_HOST   — bind address (default: 0.0.0.0)
- *   STATE_FILE  — persistence JSON path (default: ./switchboard-state.json)
+ *   STATE_FILE  — persistence JSON path (default: ./calling-all-stations-state.json)
  *   SERVER_URL  — public base URL for agent cards (default: http://localhost:PORT)
  */
 
@@ -37,7 +37,7 @@ import crypto                            from 'node:crypto'
 
 export const PORT       = Number(process.env.PORT ?? 8788)
 export const BIND_HOST  = process.env.BIND_HOST ?? '0.0.0.0'
-export const STATE_FILE = process.env.STATE_FILE ?? path.join(process.cwd(), 'switchboard-state.json')
+export const STATE_FILE = process.env.STATE_FILE ?? path.join(process.cwd(), 'calling-all-stations-state.json')
 
 // Exported for tests — overridden via SERVER_URL env var
 export function getServerUrl() {
@@ -65,7 +65,7 @@ export function persistState() {
       ts: new Date().toISOString(),
     }, null, 2), 'utf8')
   } catch (e) {
-    process.stderr.write(`[switchboard] persistState error: ${e.message}\n`)
+    process.stderr.write(`[calling-all-stations] persistState error: ${e.message}\n`)
   }
 }
 
@@ -81,7 +81,7 @@ export function hydrateState() {
       for (const [id, directives] of Object.entries(state.inboxes))
         inboxes.set(id, directives)
     }
-    process.stderr.write(`[switchboard] Hydrated ${registry.size} sessions from state\n`)
+    process.stderr.write(`[calling-all-stations] Hydrated ${registry.size} sessions from state\n`)
   } catch {}
 }
 
@@ -100,7 +100,7 @@ export function autoRegister(session_id, via, skills = []) {
     })
     inboxes.set(session_id, [])
     persistState()
-    process.stderr.write(`[switchboard] auto-registered ${session_id.slice(0,8)} via ${via}\n`)
+    process.stderr.write(`[calling-all-stations] auto-registered ${session_id.slice(0,8)} via ${via}\n`)
   }
 }
 
@@ -349,7 +349,7 @@ export function updateTask(taskId, patch) {
   // Validate state transition if state is changing
   if (patch.status?.state && patch.status.state !== task.status.state) {
     if (!isValidTransition(task.status.state, patch.status.state)) {
-      process.stderr.write(`[switchboard] invalid transition ${task.status.state} → ${patch.status.state} for task ${taskId.slice(0,8)}\n`)
+      process.stderr.write(`[calling-all-stations] invalid transition ${task.status.state} → ${patch.status.state} for task ${taskId.slice(0,8)}\n`)
       return { error: `invalid_transition:${task.status.state}→${patch.status.state}`, task }
     }
   }
@@ -452,7 +452,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
       return { jsonrpc: '2.0', id, error: { code: -32002, message: `Task already in terminal state: ${task.status.state}` } }
     }
     updateTask(taskId, { status: { state: 'canceled' } })
-    process.stderr.write(`[switchboard] A2A task ${taskId.slice(0,8)} canceled\n`)
+    process.stderr.write(`[calling-all-stations] A2A task ${taskId.slice(0,8)} canceled\n`)
     return { jsonrpc: '2.0', id, result: { task: getTask(taskId) } }
   }
 
@@ -499,7 +499,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
       return { jsonrpc: '2.0', id, error: { code: -32002, message: `Task already in terminal state: ${task.status.state}` } }
     }
     updateTask(taskId, { status: { state: 'rejected', reason } })
-    process.stderr.write(`[switchboard] A2A task ${taskId.slice(0,8)} rejected: ${reason}\n`)
+    process.stderr.write(`[calling-all-stations] A2A task ${taskId.slice(0,8)} rejected: ${reason}\n`)
     return { jsonrpc: '2.0', id, result: { task: getTask(taskId) } }
   }
 
@@ -527,7 +527,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
       inboxes.get(sessionId).push(directive)
       updateTask(task.id, { status: { state: 'working' } })
       persistState()
-      process.stderr.write(`[switchboard] A2A task ${task.id.slice(0,8)} queued for agent ${sessionId.slice(0,8)}\n`)
+      process.stderr.write(`[calling-all-stations] A2A task ${task.id.slice(0,8)} queued for agent ${sessionId.slice(0,8)}\n`)
       return { jsonrpc: '2.0', id, result: { task } }
     }
 
@@ -557,7 +557,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
       inboxes.get(target.session_id).push(directive)
       updateTask(task.id, { status: { state: 'working' } })
       persistState()
-      process.stderr.write(`[switchboard] A2A skill-routed task ${task.id.slice(0,8)} → ${target.session_id.slice(0,8)} (${skill})\n`)
+      process.stderr.write(`[calling-all-stations] A2A skill-routed task ${task.id.slice(0,8)} → ${target.session_id.slice(0,8)} (${skill})\n`)
       return { jsonrpc: '2.0', id, result: { task } }
     }
 
@@ -569,7 +569,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
     })
     const task = createTask('broadcast', message)
     updateTask(task.id, { status: { state: 'completed' }, result: { message_id: msgId } })
-    process.stderr.write(`[switchboard] A2A broadcast ${msgId}\n`)
+    process.stderr.write(`[calling-all-stations] A2A broadcast ${msgId}\n`)
     return { jsonrpc: '2.0', id, result: { task } }
   }
 
@@ -699,7 +699,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       autoRegister(session_id, 'MCP check_inbox')
       const pending = (inboxes.get(session_id) ?? []).filter(d => !d.delivered)
       for (const d of pending) d.delivered = true
-      process.stderr.write(`[switchboard] check_inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
+      process.stderr.write(`[calling-all-stations] check_inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
       return {
         content: [{ type: 'text', text: JSON.stringify({
           directives: pending.map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at }))
@@ -729,7 +729,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
         }
       }
       persistState()
-      process.stderr.write(`[switchboard] directive -> ${session_id.slice(0,8)}: ${type}\n`)
+      process.stderr.write(`[calling-all-stations] directive -> ${session_id.slice(0,8)}: ${type}\n`)
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, directive_id: directive.id }) }] }
     }
 
@@ -763,7 +763,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
           task_id: task_id ?? null,
         },
       })
-      process.stderr.write(`[switchboard] send event=${eventType} session=${session_id.slice(0,8)}\n`)
+      process.stderr.write(`[calling-all-stations] send event=${eventType} session=${session_id.slice(0,8)}\n`)
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, message_id: msgId }) }] }
     }
 
@@ -777,7 +777,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: `already_terminal:${task.status.state}` }) }] }
       }
       updateTask(task_id, { status: { state: 'rejected', reason } })
-      process.stderr.write(`[switchboard] task rejected: ${task_id.slice(0,8)}\n`)
+      process.stderr.write(`[calling-all-stations] task rejected: ${task_id.slice(0,8)}\n`)
       broadcastNotification('notifications/message', {
         content: `Task ${task_id.slice(0,8)} rejected`,
         meta: { message_id: `m${Date.now()}`, ts: new Date().toISOString(), event: 'agent_response', task_id, state: 'rejected', reason },
@@ -800,7 +800,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       if (updated?.error) {
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: updated.error }) }] }
       }
-      process.stderr.write(`[switchboard] task ${newState}: ${task_id.slice(0,8)}\n`)
+      process.stderr.write(`[calling-all-stations] task ${newState}: ${task_id.slice(0,8)}\n`)
       broadcastNotification('notifications/message', {
         content: `Task ${task_id.slice(0,8)} ${newState}`,
         meta: { message_id: `m${Date.now()}`, ts: new Date().toISOString(), event: 'agent_response', task_id, result, state: newState },
@@ -839,7 +839,7 @@ export function createAppServer() {
             sessionIdGenerator: () => crypto.randomUUID(),
             onsessioninitialized: (sid) => {
               mcpSessions.set(sid, { transport, server: mcpServer })
-              process.stderr.write(`[switchboard] MCP session init: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
+              process.stderr.write(`[calling-all-stations] MCP session init: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
             },
           })
           let mcpServer
@@ -847,7 +847,7 @@ export function createAppServer() {
             const sid = transport.sessionId
             if (sid) {
               mcpSessions.delete(sid)
-              process.stderr.write(`[switchboard] MCP session closed: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
+              process.stderr.write(`[calling-all-stations] MCP session closed: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
             }
           }
           mcpServer = createMcpServer()
@@ -926,7 +926,7 @@ export function createAppServer() {
             content: text,
             meta: { message_id: msgId, ts: new Date().toISOString(), event: 'a2a_stream', task_id: taskId },
           })
-          process.stderr.write(`[switchboard] A2A stream ${taskId.slice(0,8)}\n`)
+          process.stderr.write(`[calling-all-stations] A2A stream ${taskId.slice(0,8)}\n`)
 
           // Emit completion
           setTimeout(() => {
@@ -1022,7 +1022,7 @@ export function createAppServer() {
           if (!taskSubscribers.has(task.id)) taskSubscribers.set(task.id, new Set())
           taskSubscribers.get(task.id).add(sub)
           req.on('close', () => { taskSubscribers.get(task.id)?.delete(sub) })
-          process.stderr.write(`[switchboard] A2A per-agent stream task ${task.id.slice(0,8)} → ${session_id.slice(0,8)}\n`)
+          process.stderr.write(`[calling-all-stations] A2A per-agent stream task ${task.id.slice(0,8)} → ${session_id.slice(0,8)}\n`)
           return
         }
 
@@ -1107,7 +1107,7 @@ export function createAppServer() {
           })
           inboxes.set(session_id, [])
           persistState()
-          process.stderr.write(`[switchboard] registered ${session_id.slice(0,8)}\n`)
+          process.stderr.write(`[calling-all-stations] registered ${session_id.slice(0,8)}\n`)
         }
         res.writeHead(204); res.end(); return
       }
@@ -1117,7 +1117,7 @@ export function createAppServer() {
         registry.delete(session_id)
         inboxes.delete(session_id)
         persistState()
-        process.stderr.write(`[switchboard] deregistered ${session_id.slice(0,8)}\n`)
+        process.stderr.write(`[calling-all-stations] deregistered ${session_id.slice(0,8)}\n`)
         res.writeHead(204); res.end(); return
       }
 
@@ -1126,7 +1126,7 @@ export function createAppServer() {
         autoRegister(session_id, 'HTTP /check-inbox')
         const pending = (inboxes.get(session_id) ?? []).filter(d => !d.delivered)
         for (const d of pending) d.delivered = true
-        process.stderr.write(`[switchboard] HTTP check-inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
+        process.stderr.write(`[calling-all-stations] HTTP check-inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ directives: pending.map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at })) }))
         return
@@ -1160,7 +1160,7 @@ export function createAppServer() {
               result: result ?? { message },
               artifacts: Array.isArray(artifacts) ? artifacts : [],
             })
-            process.stderr.write(`[switchboard] HTTP agent_response completed task ${task_id.slice(0,8)}\n`)
+            process.stderr.write(`[calling-all-stations] HTTP agent_response completed task ${task_id.slice(0,8)}\n`)
           }
         }
         const msgId = `m${Date.now()}-${++seq}`
@@ -1176,7 +1176,7 @@ export function createAppServer() {
         })
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, message_id: msgId }))
-        process.stderr.write(`[switchboard] HTTP send event=${eventType} session=${session_id?.slice(0,8)}\n`)
+        process.stderr.write(`[calling-all-stations] HTTP send event=${eventType} session=${session_id?.slice(0,8)}\n`)
         return
       }
 
@@ -1208,7 +1208,7 @@ export function createAppServer() {
           }
         }
         persistState()
-        process.stderr.write(`[switchboard] HTTP send-directive -> ${session_id.slice(0,8)}: ${type}\n`)
+        process.stderr.write(`[calling-all-stations] HTTP send-directive -> ${session_id.slice(0,8)}: ${type}\n`)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, directive_id: directive.id }))
         return
@@ -1232,7 +1232,7 @@ export function createAppServer() {
         meta: { message_id: msgId, ts: new Date().toISOString(), event: payload.event ?? 'message', ...payload },
       })
       res.writeHead(204); res.end()
-      process.stderr.write(`[switchboard] broadcast: ${content.slice(0, 120)}\n`)
+      process.stderr.write(`[calling-all-stations] broadcast: ${content.slice(0, 120)}\n`)
     })
   })
 
@@ -1251,7 +1251,7 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
 
   const httpServer = createAppServer()
   httpServer.listen(PORT, BIND_HOST, () => {
-    process.stderr.write(`[switchboard] v1.1.0 listening on ${BIND_HOST}:${PORT}\n`)
-    process.stderr.write(`[switchboard] MCP at /mcp | A2A at /a2a | Cards at /.well-known/agent-card.json\n`)
+    process.stderr.write(`[calling-all-stations] v1.2.0 listening on ${BIND_HOST}:${PORT}\n`)
+    process.stderr.write(`[calling-all-stations] MCP at /mcp | A2A at /a2a | Cards at /.well-known/agent-card.json\n`)
   })
 }

@@ -26,8 +26,8 @@ Agents register, broadcast events, ask questions, and receive directed replies t
 - **Agent Cards** — auto-generated A2A agent cards for the coordinator and each registered agent
 
 ```
-Agent A ──send(agent_question)──► switchboard ──broadcast──► Agent B / operator
-Agent B ──send_directive──────► switchboard ──inbox──────► Agent A (check_inbox)
+Agent A ──send(agent_question)──► calling-all-stations ──broadcast──► Agent B / operator
+Agent B ──send_directive──────► calling-all-stations ──inbox──────► Agent A (check_inbox)
 ```
 
 ## Quick start
@@ -312,7 +312,7 @@ List all registered agents and their state.
 |--------------|---------------------------------|--------------------------|
 | `PORT`       | `8788`                          | HTTP listen port         |
 | `BIND_HOST`  | `0.0.0.0`                       | Bind address             |
-| `STATE_FILE` | `./switchboard-state.json`      | State persistence path   |
+| `STATE_FILE` | `./calling-all-stations-state.json` | State persistence path   |
 
 ---
 

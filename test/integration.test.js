@@ -38,7 +38,7 @@ before(async () => {
   port = 19000 + Math.floor(Math.random() * 1000)
   process.env.PORT = String(port)
   process.env.SERVER_URL = `http://localhost:${port}`
-  process.env.STATE_FILE = `/tmp/switchboard-test-${port}.json`
+  process.env.STATE_FILE = `/tmp/calling-all-stations-test-${port}.json`
 
   server = createAppServer()
   await new Promise(resolve => server.listen(port, '127.0.0.1', resolve))
