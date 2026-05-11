@@ -585,6 +585,8 @@ const mcpSessions = new Map()
 
 export function broadcastNotification(method, params) {
   for (const [, { server }] of mcpSessions) {
+    // server.notification() is async and rejects if the MCP client has disconnected.
+    // The .catch() is required — an unhandled rejection here crashes the process.
     try { server.notification({ method, params }).catch(() => {}) } catch {}
   }
 }

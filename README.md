@@ -99,7 +99,7 @@ Add to `.mcp.json`:
 }
 ```
 
-Three MCP tools become available: `send`, `check_inbox`, `send_directive`.
+Five MCP tools become available: `send`, `check_inbox`, `send_directive`, `complete_task`, `reject_task`.
 
 ### Connect via REST (any agent)
 
