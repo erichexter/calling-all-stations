@@ -223,6 +223,61 @@ export function buildSkillDirectory() {
 }
 
 // ---------------------------------------------------------------------------
+// A2A Part / Artifact schema helpers (spec: A2A v1.0)
+// ---------------------------------------------------------------------------
+
+const VALID_PART_KINDS = ['text', 'raw', 'url', 'data']
+
+/**
+ * Normalize a Part to spec shape: { kind, text|raw|url|data, mediaType?, filename? }
+ * Accepts legacy { text: "..." } format and upgrades it.
+ */
+export function normalizePart(part) {
+  if (!part || typeof part !== 'object') return null
+  // Already spec-compliant
+  if (VALID_PART_KINDS.includes(part.kind)) return part
+  // Legacy: { text: "..." } → { kind: "text", text: "..." }
+  if (typeof part.text === 'string') return { kind: 'text', text: part.text, ...(part.mediaType ? { mediaType: part.mediaType } : {}) }
+  // Legacy: { data: ... } → { kind: "data", data: ... }
+  if (part.data !== undefined) return { kind: 'data', data: part.data, ...(part.mediaType ? { mediaType: part.mediaType } : {}) }
+  // Legacy: { url: "..." } → { kind: "url", url: part.url }
+  if (typeof part.url === 'string') return { kind: 'url', url: part.url, ...(part.mediaType ? { mediaType: part.mediaType } : {}) }
+  return null
+}
+
+/**
+ * Normalize an Artifact to spec shape: { artifactId, name, description, parts[], metadata?, extensions? }
+ */
+export function normalizeArtifact(artifact) {
+  if (!artifact || typeof artifact !== 'object') return null
+  return {
+    artifactId: artifact.artifactId ?? artifact.id ?? crypto.randomUUID(),
+    name: artifact.name ?? 'artifact',
+    description: artifact.description ?? '',
+    parts: Array.isArray(artifact.parts)
+      ? artifact.parts.map(normalizePart).filter(Boolean)
+      : (artifact.data !== undefined ? [{ kind: 'data', data: artifact.data, mediaType: artifact.mimeType }] : []),
+    ...(artifact.metadata ? { metadata: artifact.metadata } : {}),
+  }
+}
+
+/**
+ * Extract plain text from spec-compliant or legacy parts array.
+ */
+export function extractTextFromParts(parts) {
+  if (!Array.isArray(parts)) return ''
+  return parts
+    .map(p => {
+      if (!p) return ''
+      if (p.kind === 'text') return p.text ?? ''
+      if (typeof p.text === 'string') return p.text // legacy
+      return ''
+    })
+    .join(' ')
+    .trim()
+}
+
+// ---------------------------------------------------------------------------
 // A2A task management
 // ---------------------------------------------------------------------------
 
@@ -360,7 +415,7 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
     // Coordinator: extract skill or broadcast
     const skill = params?.skill
     const text = Array.isArray(message.parts)
-      ? message.parts.map(p => p.text ?? '').join(' ')
+      ? extractTextFromParts(message.parts)
       : (message.text ?? JSON.stringify(message))
 
     if (skill) {
@@ -693,7 +748,7 @@ export function createAppServer() {
           // Broadcast and stream the result
           const skill = params?.skill
           const text = Array.isArray(message.parts)
-            ? message.parts.map(p => p.text ?? '').join(' ')
+            ? extractTextFromParts(message.parts)
             : (message.text ?? JSON.stringify(message))
           const msgId = `m${Date.now()}-${++seq}`
           broadcastNotification('notifications/message', {

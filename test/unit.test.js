@@ -22,6 +22,9 @@ import {
   handleA2aRequest,
   validateA2aVersion,
   SUPPORTED_A2A_VERSIONS,
+  normalizePart,
+  normalizeArtifact,
+  extractTextFromParts,
 } from '../server.js'
 
 // Reset state between tests
@@ -34,6 +37,94 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.SERVER_URL
+})
+
+// ---------------------------------------------------------------------------
+describe('normalizePart', () => {
+  test('passes through spec-compliant text part', () => {
+    const part = { kind: 'text', text: 'hello' }
+    assert.deepEqual(normalizePart(part), part)
+  })
+
+  test('passes through spec-compliant raw part', () => {
+    const part = { kind: 'raw', raw: Buffer.from('abc').toString('base64'), mediaType: 'image/png' }
+    assert.deepEqual(normalizePart(part), part)
+  })
+
+  test('upgrades legacy {text} to {kind:"text", text}', () => {
+    const result = normalizePart({ text: 'hello' })
+    assert.equal(result.kind, 'text')
+    assert.equal(result.text, 'hello')
+  })
+
+  test('upgrades legacy {data} to {kind:"data", data}', () => {
+    const result = normalizePart({ data: { foo: 1 }, mediaType: 'application/json' })
+    assert.equal(result.kind, 'data')
+    assert.deepEqual(result.data, { foo: 1 })
+    assert.equal(result.mediaType, 'application/json')
+  })
+
+  test('upgrades legacy {url} to {kind:"url", url}', () => {
+    const result = normalizePart({ url: 'https://example.com/file.pdf' })
+    assert.equal(result.kind, 'url')
+    assert.equal(result.url, 'https://example.com/file.pdf')
+  })
+
+  test('returns null for invalid input', () => {
+    assert.equal(normalizePart(null), null)
+    assert.equal(normalizePart('string'), null)
+    assert.equal(normalizePart({}), null)
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('normalizeArtifact', () => {
+  test('creates spec-compliant artifact with artifactId', () => {
+    const art = normalizeArtifact({ name: 'report', description: 'A report', parts: [{ kind: 'text', text: 'body' }] })
+    assert.ok(art.artifactId)
+    assert.equal(art.name, 'report')
+    assert.equal(art.parts[0].kind, 'text')
+  })
+
+  test('generates artifactId when missing', () => {
+    const art = normalizeArtifact({ name: 'x', parts: [] })
+    assert.ok(art.artifactId.length > 0)
+  })
+
+  test('upgrades legacy {data, mimeType} to parts', () => {
+    const art = normalizeArtifact({ name: 'file', data: '<html>', mimeType: 'text/html' })
+    assert.equal(art.parts.length, 1)
+    assert.equal(art.parts[0].kind, 'data')
+  })
+
+  test('returns null for invalid input', () => {
+    assert.equal(normalizeArtifact(null), null)
+    assert.equal(normalizeArtifact('bad'), null)
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('extractTextFromParts', () => {
+  test('extracts text from spec parts', () => {
+    const result = extractTextFromParts([{ kind: 'text', text: 'hello' }, { kind: 'text', text: 'world' }])
+    assert.equal(result, 'hello world')
+  })
+
+  test('handles legacy {text} parts', () => {
+    const result = extractTextFromParts([{ text: 'foo' }, { text: 'bar' }])
+    assert.equal(result, 'foo bar')
+  })
+
+  test('skips non-text parts gracefully', () => {
+    const result = extractTextFromParts([{ kind: 'text', text: 'hi' }, { kind: 'raw', raw: 'base64data' }])
+    assert.equal(result, 'hi')
+  })
+
+  test('returns empty string for empty or invalid input', () => {
+    assert.equal(extractTextFromParts([]), '')
+    assert.equal(extractTextFromParts(null), '')
+    assert.equal(extractTextFromParts(undefined), '')
+  })
 })
 
 // ---------------------------------------------------------------------------
