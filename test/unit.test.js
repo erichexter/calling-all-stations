@@ -175,6 +175,21 @@ describe('buildCoordinatorCard', () => {
     const card = buildCoordinatorCard()
     assert.equal(card.url, 'https://example.com/a2a')
   })
+
+  test('card has provider, securitySchemes, interfaces fields', () => {
+    const card = buildCoordinatorCard()
+    assert.ok(card.provider, 'should have provider')
+    assert.ok(typeof card.securitySchemes === 'object')
+    assert.ok(Array.isArray(card.security))
+    assert.ok(Array.isArray(card.interfaces))
+    assert.ok(card.interfaces.some(i => i.transport === 'http'))
+    assert.ok(card.interfaces.some(i => i.transport === 'mcp'))
+  })
+
+  test('card capabilities has stateTransitionHistory field', () => {
+    const card = buildCoordinatorCard()
+    assert.ok('stateTransitionHistory' in card.capabilities)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -480,6 +495,18 @@ describe('handleA2aRequest', () => {
     const res = handleA2aRequest({ jsonrpc: '2.0', id: 1, method: 'listTasks', params: { status: 'completed' } }, null, 'http://test.local')
     assert.equal(res.result.tasks.length, 1)
     assert.equal(res.result.tasks[0].status.state, 'completed')
+  })
+
+  test('sendMessage passes returnImmediately in directive body', () => {
+    registry.set('sess-ri', { session_id: 'sess-ri', label: 'RI', status: 'running', current_step: 'idle', skills: [] })
+    inboxes.set('sess-ri', [])
+    const res = handleA2aRequest(
+      { jsonrpc: '2.0', id: 1, method: 'sendMessage', params: { returnImmediately: false, message: { parts: [{ kind: 'text', text: 'hi' }] } } },
+      'sess-ri', 'http://test.local'
+    )
+    assert.ok(!res.error)
+    const directive = inboxes.get('sess-ri').find(d => d.type === 'a2a_message')
+    assert.equal(directive.body.returnImmediately, false)
   })
 
   test('A2A-Version unsupported returns error', () => {

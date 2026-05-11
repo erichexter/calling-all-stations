@@ -120,11 +120,21 @@ export function buildCoordinatorCard() {
     url: `${base}/a2a`,
     humanReadableId: 'calling-all-stations/coordinator',
     version: '1.0.0',
+    provider: {
+      name: 'calling-all-stations',
+      url: base,
+    },
     capabilities: {
       streaming: true,
       pushNotifications: false,
-      extended_agent_card: false,
+      stateTransitionHistory: false,
     },
+    securitySchemes: {},
+    security: [],
+    interfaces: [
+      { transport: 'http', url: `${base}/a2a` },
+      { transport: 'mcp', url: `${base}/mcp`, description: 'MCP Streamable HTTP (Claude / MCP agents)' },
+    ],
     skills: [
       {
         id: 'broadcast',
@@ -174,7 +184,13 @@ export function buildAgentCard(session_id) {
     url: `${base}/agents/${session_id}/a2a`,
     humanReadableId: `calling-all-stations/${session_id}`,
     version: '1.0.0',
-    capabilities: { streaming: false, pushNotifications: false },
+    provider: {
+      name: 'calling-all-stations',
+      url: base,
+    },
+    capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false },
+    securitySchemes: {},
+    security: [],
     skills,
     defaultInputModes: ['application/json', 'text/plain'],
     defaultOutputModes: ['application/json', 'text/plain'],
@@ -396,11 +412,12 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
       if (!registry.has(sessionId)) {
         return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Agent not found' } }
       }
+      const returnImmediately = params?.returnImmediately !== false // default true for non-blocking
       const task = createTask(sessionId, message, params?.contextId ?? null)
       const directive = {
         id: crypto.randomUUID(),
         type: 'a2a_message',
-        body: { task_id: task.id, message },
+        body: { task_id: task.id, message, returnImmediately },
         sent_at: new Date().toISOString(),
         delivered: false,
       }
