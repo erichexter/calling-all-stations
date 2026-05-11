@@ -1,0 +1,25 @@
+{
+  "name": "switchboard",
+  "version": "1.0.0",
+  "description": "Multi-agent coordination server — MCP Streamable HTTP + REST for cross-agent messaging, registry, and directed communication",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "multi-agent",
+    "llm",
+    "coordination",
+    "streamable-http"
+  ],
+  "license": "MIT"
+}

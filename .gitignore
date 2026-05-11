@@ -1,0 +1,4 @@
+node_modules/
+switchboard-state.json
+*.log
+.env
