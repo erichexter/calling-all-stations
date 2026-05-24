@@ -53,6 +53,29 @@ export const registry = new Map()   // session_id -> agent_info
 export const inboxes  = new Map()   // session_id -> [directive, ...]
 export const tasks    = new Map()   // task_id    -> a2a task object
 
+// Persona-scoped event queues for HTTP long-poll / streaming delivery.
+// Keyed by persona name (e.g. 'wolf'), independent of MCP transport lifecycle.
+export const personaQueues   = new Map()  // persona -> [{ id, body, ts }]
+export const personaWaiters  = new Map()  // persona -> [resolveFn]
+export const personaLastPoll = new Map()  // persona -> ISO timestamp of last stream connect
+const PERSONA_QUEUE_MAX = 50
+const PERSONA_QUEUE_TTL_MS = 10 * 60 * 1000
+
+export function enqueuePersonaEvent(persona, event) {
+  if (!persona) return null
+  if (!personaQueues.has(persona)) personaQueues.set(persona, [])
+  const q = personaQueues.get(persona)
+  const cutoff = Date.now() - PERSONA_QUEUE_TTL_MS
+  while (q.length && Date.parse(q[0].ts) < cutoff) q.shift()
+  const item = { id: crypto.randomUUID(), body: event, ts: new Date().toISOString() }
+  q.push(item)
+  while (q.length > PERSONA_QUEUE_MAX) q.shift()
+  const waiters = personaWaiters.get(persona) || []
+  personaWaiters.set(persona, [])
+  for (const w of waiters) { try { w(item) } catch {} }
+  return item
+}
+
 export function persistState() {
   try {
     const inboxSnapshot = {}
@@ -1094,6 +1117,50 @@ export function createAppServer() {
       res.writeHead(204); res.end(); return
     }
 
+    // Persona event stream (HTTP chunked NDJSON, one JSON line per event).
+    // Intended for Monitor / curl -N consumers. Survives MCP reconnects.
+    // GET /inbox/:persona/stream — holds open until client disconnects.
+    if (req.method === 'GET' && req.url.startsWith('/inbox/') && req.url.endsWith('/stream')) {
+      const persona = req.url.slice('/inbox/'.length, -'/stream'.length)
+      if (!persona) { res.writeHead(400); res.end('persona required'); return }
+      personaLastPoll.set(persona, new Date().toISOString())
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      })
+      const backlog = personaQueues.get(persona) || []
+      for (const item of backlog) {
+        res.write(JSON.stringify({ id: item.id, ts: item.ts, ...item.body }) + '\n')
+      }
+      personaQueues.set(persona, [])
+      const subscribe = () => {
+        const arr = personaWaiters.get(persona) || []
+        arr.push(item => {
+          try {
+            res.write(JSON.stringify({ id: item.id, ts: item.ts, ...item.body }) + '\n')
+            personaLastPoll.set(persona, new Date().toISOString())
+          } catch {}
+          subscribe()
+        })
+        personaWaiters.set(persona, arr)
+      }
+      subscribe()
+      const heartbeat = setInterval(() => {
+        try {
+          res.write(JSON.stringify({ event: 'keepalive', ts: new Date().toISOString() }) + '\n')
+          personaLastPoll.set(persona, new Date().toISOString())
+        } catch {}
+      }, 25_000)
+      req.on('close', () => {
+        clearInterval(heartbeat)
+        process.stderr.write(`[calling-all-stations] /inbox/${persona}/stream disconnected\n`)
+      })
+      process.stderr.write(`[calling-all-stations] /inbox/${persona}/stream connected\n`)
+      return
+    }
+
     if (req.method !== 'POST') {
       res.writeHead(405); res.end('Method Not Allowed'); return
     }
@@ -1106,21 +1173,28 @@ export function createAppServer() {
       try { payload = JSON.parse(body) } catch { payload = { message: body.trim() } }
 
       if (req.url === '/register') {
-        const { session_id, issue_number, label, started_at, skills } = payload
+        const { session_id, issue_number, label, started_at, skills, persona, wakeup_url, kind } = payload
         if (session_id) {
+          const existing = registry.get(session_id) ?? {}
+          // kind: 'wakeup_only' means this is a persona-placeholder entry holding a wakeup URL.
+          // It is NOT an active subscribed session — dispatcher should fall through to the wakeup path.
+          const isWakeupOnly = kind === 'wakeup_only'
           registry.set(session_id, {
             session_id,
-            issue_number: issue_number ?? null,
-            label: label ?? 'registered',
-            started_at: started_at ?? new Date().toISOString(),
-            status: 'running',
+            issue_number: issue_number ?? existing.issue_number ?? null,
+            label: label ?? existing.label ?? 'registered',
+            started_at: started_at ?? existing.started_at ?? new Date().toISOString(),
+            status: isWakeupOnly ? 'wakeup_only' : 'running',
             last_status_at: new Date().toISOString(),
-            current_step: 'starting',
-            skills: Array.isArray(skills) ? skills : [],
+            current_step: isWakeupOnly ? 'idle' : 'starting',
+            skills: Array.isArray(skills) ? skills : (existing.skills ?? []),
+            persona: persona ?? existing.persona ?? null,
+            wakeup_url: wakeup_url ?? existing.wakeup_url ?? null,
+            kind: kind ?? existing.kind ?? null,
           })
-          inboxes.set(session_id, [])
+          inboxes.set(session_id, inboxes.get(session_id) ?? [])
           persistState()
-          process.stderr.write(`[calling-all-stations] registered ${session_id.slice(0,8)}\n`)
+          process.stderr.write(`[calling-all-stations] registered ${session_id.slice(0,8)} persona=${persona ?? '-'} wakeup=${wakeup_url ?? '-'} kind=${kind ?? '-'}\n`)
         }
         res.writeHead(204); res.end(); return
       }
@@ -1235,6 +1309,129 @@ export function createAppServer() {
           entry.last_status_at = new Date().toISOString()
         }
         res.writeHead(204); res.end(); return
+      }
+
+      // Mattermost outgoing webhook receiver.
+      // Mattermost POSTs here when a trigger word fires (e.g. "@wolf").
+      // Two delivery paths:
+      //   1) If the target persona has an active session in the registry → broadcast (push)
+      //   2) Otherwise, if the persona has a registered wakeup_url → POST to it (wake-up)
+      // Self-mention and bot-to-self loops are skipped at the persona level.
+      if (req.url === '/mm-webhook') {
+        // Mattermost sends application/x-www-form-urlencoded OR application/json
+        let mm = payload
+        if (typeof payload === 'object' && payload.text === undefined && body) {
+          try {
+            const params = new URLSearchParams(body)
+            mm = Object.fromEntries(params)
+          } catch (e) { mm = payload }
+        }
+        const triggerWord = (mm.trigger_word || '').toLowerCase()
+        const userName = mm.user_name || 'unknown'
+        const channelName = mm.channel_name || 'unknown'
+        const text = mm.text || ''
+        const postId = mm.post_id || ''
+        const rootId = mm.root_id || mm.parent_id || ''
+        const persona = triggerWord.startsWith('@') ? triggerWord.slice(1) : triggerWord
+
+        // Self-mention loop guard: if the message came from the persona's own bot account, skip.
+        if (userName.toLowerCase() === persona) {
+          process.stderr.write(`[calling-all-stations] mm-webhook: skipping self-mention ${persona}\n`)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, skipped: 'self_mention' })); return
+        }
+
+        process.stderr.write(`[calling-all-stations] mm-webhook: #${channelName} ${userName} -> @${persona}\n`)
+
+        const mentionEvent = {
+          event: 'mattermost_mention',
+          persona,
+          channel: channelName,
+          from: userName,
+          text,
+          post_id: postId,
+          root_id: rootId,
+          ts: new Date().toISOString()
+        }
+
+        // Always enqueue to the persona-scoped queue. Any live HTTP stream
+        // consumer (Monitor) will receive it immediately; otherwise it sits
+        // in the bounded queue until the persona reconnects or TTL evicts.
+        enqueuePersonaEvent(persona, mentionEvent)
+
+        // If a live stream consumer has polled within the keepalive window,
+        // skip the wakeup-spawn fallback entirely — the queue delivered it.
+        const lastPoll = personaLastPoll.get(persona)
+        const livePoller = lastPoll && (Date.now() - Date.parse(lastPoll)) < 60_000
+        if (livePoller) {
+          process.stderr.write(`[calling-all-stations] mm-webhook: enqueued to ${persona} (live stream, last_poll ${lastPoll})\n`)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, delivered: 'stream_queue', persona })); return
+        }
+
+        // Path 1: find an active session for this persona, push to it
+        let activeSession = null
+        for (const entry of registry.values()) {
+          if (entry.persona === persona && entry.status === 'running') {
+            activeSession = entry; break
+          }
+        }
+
+        if (activeSession) {
+          // Drop a directive in the active session's inbox AND broadcast notification
+          if (!inboxes.has(activeSession.session_id)) inboxes.set(activeSession.session_id, [])
+          inboxes.get(activeSession.session_id).push({
+            id: crypto.randomUUID(),
+            type: 'mattermost_mention',
+            body: mentionEvent,
+            sent_at: new Date().toISOString(),
+            delivered: false
+          })
+          broadcastNotification('notifications/message', {
+            content: `<channel source="calling-all-stations">${JSON.stringify(mentionEvent)}</channel>`,
+            meta: mentionEvent
+          })
+          persistState()
+          process.stderr.write(`[calling-all-stations] mm-webhook: pushed to active session ${activeSession.session_id.slice(0,8)}\n`)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, delivered: 'active_session', session: activeSession.session_id })); return
+        }
+
+        // Path 2: wake-up. Find a registered wakeup_url for this persona (could be on stale entries).
+        let wakeupUrl = null
+        for (const entry of registry.values()) {
+          if (entry.persona === persona && entry.wakeup_url) {
+            wakeupUrl = entry.wakeup_url; break
+          }
+        }
+
+        if (wakeupUrl) {
+          // Fire and forget POST to the persona's hook-agent.
+          // We don't await — Mattermost just needs a 200 OK fast.
+          import('http').then(http => {
+            try {
+              const u = new URL(wakeupUrl)
+              const body = JSON.stringify(mentionEvent)
+              const req2 = http.request({
+                hostname: u.hostname, port: u.port || 80, path: u.pathname + (u.search || ''),
+                method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+                timeout: 5000
+              }, () => {})
+              req2.on('error', e => process.stderr.write(`[calling-all-stations] wakeup error: ${e.message}\n`))
+              req2.write(body); req2.end()
+            } catch (e) {
+              process.stderr.write(`[calling-all-stations] wakeup dispatch failed: ${e.message}\n`)
+            }
+          })
+          process.stderr.write(`[calling-all-stations] mm-webhook: woke ${persona} at ${wakeupUrl}\n`)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, delivered: 'wakeup', url: wakeupUrl })); return
+        }
+
+        // No active session AND no wakeup URL → log and accept (Mattermost still expects 200).
+        process.stderr.write(`[calling-all-stations] mm-webhook: no delivery path for persona=${persona}\n`)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, delivered: 'none', reason: 'no_active_session_no_wakeup_url', persona })); return
       }
 
       // Default: broadcast notification
