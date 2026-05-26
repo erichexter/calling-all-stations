@@ -2,3 +2,5 @@ node_modules/
 switchboard-state.json
 *.log
 .env
+calling-all-stations-state.json
+server-stdouterr.log

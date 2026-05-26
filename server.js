@@ -29,12 +29,65 @@
 
 import { Server }                        from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
-import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { ListToolsRequestSchema, CallToolRequestSchema, EmptyResultSchema } from '@modelcontextprotocol/sdk/types.js'
 import { createServer }                  from 'node:http'
 import { fileURLToPath }                 from 'node:url'
 import fs                                from 'node:fs'
 import path                              from 'node:path'
 import crypto                            from 'node:crypto'
+
+// ============================================================================
+// OBSERVABILITY (verbose-debug mode — stays on until we hit 7 days stable)
+// ============================================================================
+const __dir_obs = path.dirname(fileURLToPath(import.meta.url))
+const LOG_FILE = path.join(__dir_obs, 'server.log')
+const LOG_MAX_BYTES = 10 * 1024 * 1024  // 10 MB before rotate
+const LOG_KEEP = 5
+let __log_stream = null
+function _openLog() {
+  try { __log_stream = fs.createWriteStream(LOG_FILE, { flags: 'a' }) } catch (e) {}
+}
+_openLog()
+function _maybeRotate() {
+  try {
+    const s = fs.statSync(LOG_FILE)
+    if (s.size < LOG_MAX_BYTES) return
+    try { __log_stream && __log_stream.end() } catch {}
+    for (let i = LOG_KEEP - 1; i >= 1; i--) {
+      const from = `${LOG_FILE}.${i}`, to = `${LOG_FILE}.${i+1}`
+      if (fs.existsSync(from)) { try { fs.renameSync(from, to) } catch {} }
+    }
+    try { fs.renameSync(LOG_FILE, `${LOG_FILE}.1`) } catch {}
+    _openLog()
+  } catch (e) {}
+}
+setInterval(_maybeRotate, 60_000)
+// Single structured logger — writes to BOTH stderr (for schtask capture if redirected) AND file
+export function dlog(level, scope, ...args) {
+  const ts = new Date().toISOString()
+  const msg = args.map(a => typeof a === 'string' ? a : (() => { try { return JSON.stringify(a) } catch { return String(a) } })()).join(' ')
+  const line = `${ts} [${level}] [${scope}] ${msg}\n`
+  try { process.stderr.write(line) } catch {}
+  try { __log_stream && __log_stream.write(line) } catch {}
+}
+// Counters for /metrics endpoint
+export const counters = {
+  startup_ts: new Date().toISOString(),
+  http_requests: 0,
+  http_errors: 0,
+  mcp_tool_calls: {},
+  wakeups_attempted: 0,
+  wakeups_succeeded: 0,
+  wakeups_timed_out: 0,
+  wakeups_errored: 0,
+  directives_sent: 0,
+  inbox_checks: 0,
+  registry_size: 0,
+  state_persists: 0,
+  uncaught_exceptions: 0,
+  unhandled_rejections: 0,
+}
+dlog('INFO', 'observability', 'log file', LOG_FILE)
 
 export const PORT       = Number(process.env.PORT ?? 8788)
 export const BIND_HOST  = process.env.BIND_HOST ?? '0.0.0.0'
@@ -740,22 +793,54 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       const directive = { id: crypto.randomUUID(), type, body, sent_at: new Date().toISOString(), delivered: false }
       if (!inboxes.has(session_id)) inboxes.set(session_id, [])
       inboxes.get(session_id).push(directive)
-      if (type === 'answer') {
-        const entry = registry.get(session_id)
-        if (entry) {
-          entry.waiting_for_answer = false
-          entry.last_status_at = new Date().toISOString()
-          // Resume any input_required task for this agent back to working
-          for (const task of tasks.values()) {
-            if (task.session_id === session_id && task.status.state === 'input_required') {
-              updateTask(task.id, { status: { state: 'working' } })
-              break
-            }
+      const entry = registry.get(session_id)
+      if (type === 'answer' && entry) {
+        entry.waiting_for_answer = false
+        entry.last_status_at = new Date().toISOString()
+        // Resume any input_required task for this agent back to working
+        for (const task of tasks.values()) {
+          if (task.session_id === session_id && task.status.state === 'input_required') {
+            updateTask(task.id, { status: { state: 'working' } })
+            break
           }
         }
       }
       persistState()
       process.stderr.write(`[calling-all-stations] directive -> ${session_id.slice(0,8)}: ${type}\n`)
+      // Wake-up dispatch: if target is wakeup_only with a wakeup_url, POST the directive so
+      // the remote hook-agent fires immediately instead of waiting for a check_inbox poll
+      // that will never come. Fire-and-forget; client already has its directive_id.
+      // We coerce the directive body to a plain string before posting, because remote
+      // hook-agents (e.g. mike-hook-agent.js) do `${directive}` string interpolation —
+      // an unstringified object becomes "[object Object]". Prefer .message > .task >
+      // .instruction > JSON.stringify(whole body).
+      if (entry && entry.wakeup_url && entry.kind === 'wakeup_only') {
+        counters.wakeups_attempted++; counters.directives_sent++
+        dlog('DEBUG', 'wakeup-mcp', { target: session_id.slice(0,8), url: entry.wakeup_url, type })
+        const directiveText = typeof body === 'string'
+          ? body
+          : (body && (body.message || body.task || body.instruction)) || JSON.stringify(body)
+        import('http').then(http => {
+          try {
+            const u = new URL(entry.wakeup_url)
+            const payload = JSON.stringify({ body: directiveText, directive_id: directive.id, type, from: 'send_directive', meta: typeof body === 'object' ? body : null })
+            const req2 = http.request({
+              hostname: u.hostname, port: u.port || 80, path: u.pathname + (u.search || ''),
+              method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+              timeout: 5000
+            }, (resp) => { resp.resume(); counters.wakeups_succeeded++; dlog('DEBUG','wakeup-mcp',{target:session_id.slice(0,8),status:resp.statusCode}) })
+            req2.on('timeout', () => {
+              counters.wakeups_timed_out++
+              dlog('WARN','wakeup-mcp', `TIMEOUT target=${session_id.slice(0,8)} url=${entry.wakeup_url}`)
+              req2.destroy(new Error('wakeup timeout'))
+            })
+            req2.on('error', e => { counters.wakeups_errored++; dlog('ERROR','wakeup-mcp',`target=${session_id.slice(0,8)} err=${e.message}`) })
+            req2.write(payload); req2.end()
+          } catch (e) {
+            process.stderr.write(`[calling-all-stations] directive wakeup dispatch failed: ${e.message}\n`)
+          }
+        })
+      }
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, directive_id: directive.id }) }] }
     }
 
@@ -846,6 +931,35 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
 
 export function createAppServer() {
   const httpServer = createServer(async (req, res) => {
+    // Request-level observability — every HTTP request logged with method, url, status, latency
+    const __req_start = Date.now()
+    const __req_method = req.method
+    const __req_url = req.url
+    counters.http_requests++
+    res.once('finish', () => {
+      const dur = Date.now() - __req_start
+      if (res.statusCode >= 400) counters.http_errors++
+      const level = res.statusCode >= 500 ? 'ERROR' : (res.statusCode >= 400 ? 'WARN' : 'DEBUG')
+      dlog(level, 'http', `${__req_method} ${__req_url} ${res.statusCode} ${dur}ms`)
+    })
+
+    // /metrics — counter snapshot for observability + alerting
+    if (req.method === 'GET' && req.url === '/metrics') {
+      counters.registry_size = registry.size
+      const mem = process.memoryUsage()
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        ...counters,
+        uptime_s: Math.round(process.uptime()),
+        inboxes: inboxes.size,
+        tasks: tasks.size,
+        mcp_sessions: mcpSessions.size,
+        rss_mb: Math.round(mem.rss / 1024 / 1024),
+        heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
+        now: new Date().toISOString(),
+      }, null, 2))
+      return
+    }
 
     // MCP Streamable HTTP
     if (req.url === '/mcp') {
@@ -864,16 +978,34 @@ export function createAppServer() {
           const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
             onsessioninitialized: (sid) => {
-              mcpSessions.set(sid, { transport, server: mcpServer })
-              process.stderr.write(`[calling-all-stations] MCP session init: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
+              // KEEPALIVE: per MCP spec utilities/ping — server-initiated ping every 25s.
+              // Standard JSON-RPC request, client responds with empty result. Per spec:
+              // "Implementations SHOULD periodically issue pings to detect connection health"
+              // and "Multiple failed pings MAY trigger connection reset."
+              // Ref: https://modelcontextprotocol.info/specification/draft/basic/utilities/ping/
+              const heartbeat = setInterval(async () => {
+                try {
+                  await mcpServer.request({ method: 'ping' }, EmptyResultSchema)
+                  counters.mcp_keepalives_sent = (counters.mcp_keepalives_sent || 0) + 1
+                } catch (e) {
+                  counters.mcp_keepalives_failed = (counters.mcp_keepalives_failed || 0) + 1
+                  dlog('WARN', 'mcp-ping', `session=${sid.slice(0,8)} err=${e.message}`)
+                  // Spec-blessed: treat timeout / repeated failure as a dead connection
+                  clearInterval(heartbeat)
+                }
+              }, 25_000)
+              mcpSessions.set(sid, { transport, server: mcpServer, heartbeat })
+              dlog('INFO', 'mcp', `session init ${sid.slice(0,8)} (total=${mcpSessions.size}, keepalive=25s)`)
             },
           })
           let mcpServer
           transport.onclose = () => {
             const sid = transport.sessionId
             if (sid) {
+              const sess = mcpSessions.get(sid)
+              if (sess?.heartbeat) clearInterval(sess.heartbeat)
               mcpSessions.delete(sid)
-              process.stderr.write(`[calling-all-stations] MCP session closed: ${sid.slice(0,8)} (total: ${mcpSessions.size})\n`)
+              dlog('INFO', 'mcp', `session closed ${sid.slice(0,8)} (total=${mcpSessions.size})`)
             }
           }
           mcpServer = createMcpServer()
@@ -1208,8 +1340,25 @@ export function createAppServer() {
         res.writeHead(204); res.end(); return
       }
 
-      if (req.url === '/check-inbox') {
-        const { session_id } = payload
+      if (req.url === '/check-inbox' || req.url === '/check_inbox') {
+        // Accept canonical {session_id} or natural {to} / {persona}. Resolve persona
+        // shortcut (e.g. "mike") to <persona>-persistent so remote agents can poll
+        // their own inbox using their own name.
+        let session_id = payload.session_id || payload.to || payload.persona
+        if (session_id && !registry.has(session_id)) {
+          const persistent = `${session_id}-persistent`
+          if (registry.has(persistent)) {
+            session_id = persistent
+          } else {
+            for (const [sid, entry] of registry.entries()) {
+              if (entry.persona === session_id && entry.kind === 'wakeup_only') { session_id = sid; break }
+            }
+          }
+        }
+        if (!session_id) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'missing session_id (or to/persona)' })); return
+        }
         autoRegister(session_id, 'HTTP /check-inbox')
         const pending = (inboxes.get(session_id) ?? []).filter(d => !d.delivered)
         for (const d of pending) d.delivered = true
@@ -1267,11 +1416,33 @@ export function createAppServer() {
         return
       }
 
-      if (req.url === '/send-directive') {
-        const { session_id, type, body: directiveBody } = payload
-        if (!session_id || !type || !directiveBody) {
+      if (req.url === '/send-directive' || req.url === '/send_directive') {
+        // Accept both the canonical {session_id, type, body} and the more natural
+        // {to, type, text|message|body, from} shape that remote agents tend to guess.
+        let session_id = payload.session_id || payload.to
+        const type = payload.type || 'message'
+        let directiveBody = payload.body
+        if (!directiveBody) {
+          if (payload.text || payload.message) {
+            directiveBody = { from: payload.from || 'unknown', message: payload.text || payload.message }
+          }
+        }
+        if (!session_id || !directiveBody) {
           res.writeHead(400, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ ok: false, error: 'missing session_id, type, or body' })); return
+          res.end(JSON.stringify({ ok: false, error: 'missing session_id (or to), and body (or text/message)' })); return
+        }
+        // Persona resolution: if session_id isn't found, try <persona>-persistent, then
+        // look up by persona field. Remote agents tend to guess "wolf" / "mike" instead
+        // of the full session id, and we should route them rather than 404.
+        if (!registry.has(session_id)) {
+          const personaCandidate = `${session_id}-persistent`
+          if (registry.has(personaCandidate)) {
+            session_id = personaCandidate
+          } else {
+            for (const [sid, entry] of registry.entries()) {
+              if (entry.persona === session_id && entry.wakeup_url) { session_id = sid; break }
+            }
+          }
         }
         if (!registry.has(session_id)) {
           res.writeHead(404, { 'content-type': 'application/json' })
@@ -1280,22 +1451,48 @@ export function createAppServer() {
         const directive = { id: crypto.randomUUID(), type, body: directiveBody, sent_at: new Date().toISOString(), delivered: false }
         if (!inboxes.has(session_id)) inboxes.set(session_id, [])
         inboxes.get(session_id).push(directive)
-        if (type === 'answer') {
-          const entry = registry.get(session_id)
-          if (entry) {
-            entry.waiting_for_answer = false
-            entry.last_status_at = new Date().toISOString()
-            // Resume any input_required task back to working
-            for (const task of tasks.values()) {
-              if (task.session_id === session_id && task.status.state === 'input_required') {
-                updateTask(task.id, { status: { state: 'working' } })
-                break
-              }
+        const entry = registry.get(session_id)
+        if (type === 'answer' && entry) {
+          entry.waiting_for_answer = false
+          entry.last_status_at = new Date().toISOString()
+          // Resume any input_required task back to working
+          for (const task of tasks.values()) {
+            if (task.session_id === session_id && task.status.state === 'input_required') {
+              updateTask(task.id, { status: { state: 'working' } })
+              break
             }
           }
         }
         persistState()
         process.stderr.write(`[calling-all-stations] HTTP send-directive -> ${session_id.slice(0,8)}: ${type}\n`)
+        // Wake-up dispatch (same as MCP send_directive path)
+        if (entry && entry.wakeup_url && entry.kind === 'wakeup_only') {
+          const directiveText = typeof directiveBody === 'string'
+            ? directiveBody
+            : (directiveBody && (directiveBody.message || directiveBody.task || directiveBody.instruction)) || JSON.stringify(directiveBody)
+          import('http').then(http => {
+            try {
+              const u = new URL(entry.wakeup_url)
+              const wakePayload = JSON.stringify({ body: directiveText, directive_id: directive.id, type, from: 'send_directive_http', meta: typeof directiveBody === 'object' ? directiveBody : null })
+              const req2 = http.request({
+                hostname: u.hostname, port: u.port || 80, path: u.pathname + (u.search || ''),
+                method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(wakePayload) },
+                timeout: 5000
+              }, (resp) => { resp.resume(); counters.wakeups_succeeded++; dlog('DEBUG','wakeup-http',{target:session_id.slice(0,8),status:resp.statusCode}) })
+              req2.on('timeout', () => {
+                counters.wakeups_timed_out++
+                dlog('WARN','wakeup-http', `TIMEOUT target=${session_id.slice(0,8)} url=${entry.wakeup_url}`)
+                req2.destroy(new Error('wakeup timeout'))
+              })
+              req2.on('error', e => { counters.wakeups_errored++; dlog('ERROR','wakeup-http',`target=${session_id.slice(0,8)} err=${e.message}`) })
+              req2.write(wakePayload); req2.end()
+              counters.wakeups_attempted++; counters.directives_sent++
+              dlog('DEBUG','wakeup-http',{target:session_id.slice(0,8),url:entry.wakeup_url,type})
+            } catch (e) {
+              process.stderr.write(`[calling-all-stations] HTTP directive wakeup dispatch failed: ${e.message}\n`)
+            }
+          })
+        }
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, directive_id: directive.id }))
         return
@@ -1416,7 +1613,11 @@ export function createAppServer() {
                 hostname: u.hostname, port: u.port || 80, path: u.pathname + (u.search || ''),
                 method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
                 timeout: 5000
-              }, () => {})
+              }, (resp) => { resp.resume() })
+              req2.on('timeout', () => {
+                process.stderr.write(`[calling-all-stations] mm-webhook wakeup TIMEOUT at ${wakeupUrl}\n`)
+                req2.destroy(new Error('mm-webhook wakeup timeout'))
+              })
               req2.on('error', e => process.stderr.write(`[calling-all-stations] wakeup error: ${e.message}\n`))
               req2.write(body); req2.end()
             } catch (e) {
@@ -1457,13 +1658,51 @@ export function createAppServer() {
 // Uses fileURLToPath + path.resolve for Windows compatibility (argv[1] may be relative).
 const __filename = fileURLToPath(import.meta.url)
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  // ROBUSTNESS: never let a bad promise or sync throw bring the process down silently.
+  process.on('uncaughtException', (err) => {
+    counters.uncaught_exceptions++
+    dlog('ERROR', 'process', 'UNCAUGHT EXCEPTION:', err.stack || err.message || String(err))
+  })
+  process.on('unhandledRejection', (reason) => {
+    counters.unhandled_rejections++
+    dlog('ERROR', 'process', 'UNHANDLED REJECTION:', reason && reason.stack ? reason.stack : String(reason))
+  })
+  process.on('SIGTERM', () => { dlog('INFO', 'process', 'SIGTERM received, exiting'); process.exit(0) })
+  process.on('SIGINT',  () => { dlog('INFO', 'process', 'SIGINT received, exiting');  process.exit(0) })
+
   hydrateState()
-  setInterval(persistState, 30_000)
+  dlog('INFO', 'state', 'hydrated', { registry: registry.size, inboxes: inboxes.size, tasks: tasks.size })
+  setInterval(() => { try { persistState(); counters.state_persists++ } catch (e) { dlog('ERROR','state','persist failed',e.message) } }, 30_000)
   setInterval(pruneExpiredTasks, 5 * 60 * 1000)
+  // Periodic self-stat heartbeat — every 30s we log a single structured line so we can
+  // trace what the process looked like before any hang or restart.
+  setInterval(() => {
+    try {
+      counters.registry_size = registry.size
+      const mem = process.memoryUsage()
+      dlog('STAT', 'self', {
+        up_s: Math.round(process.uptime()),
+        registry: registry.size,
+        inboxes: inboxes.size,
+        tasks: tasks.size,
+        mcp_sessions: mcpSessions.size,
+        http_requests: counters.http_requests,
+        http_errors: counters.http_errors,
+        wake_att: counters.wakeups_attempted,
+        wake_ok: counters.wakeups_succeeded,
+        wake_to: counters.wakeups_timed_out,
+        wake_err: counters.wakeups_errored,
+        unc_ex: counters.uncaught_exceptions,
+        unh_rej: counters.unhandled_rejections,
+        rss_mb: Math.round(mem.rss / 1024 / 1024),
+        heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
+      })
+    } catch (e) { dlog('ERROR','self-stat','failed',e.message) }
+  }, 30_000)
 
   const httpServer = createAppServer()
   httpServer.listen(PORT, BIND_HOST, () => {
-    process.stderr.write(`[calling-all-stations] v1.2.0 listening on ${BIND_HOST}:${PORT}\n`)
-    process.stderr.write(`[calling-all-stations] MCP at /mcp | A2A at /a2a | Cards at /.well-known/agent-card.json\n`)
+    dlog('INFO', 'http', `v1.2.2 listening on ${BIND_HOST}:${PORT}`)
+    dlog('INFO', 'http', 'MCP at /mcp | A2A at /a2a | Cards at /.well-known/agent-card.json | /metrics for counters')
   })
 }
