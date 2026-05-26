@@ -29,7 +29,7 @@
 
 import { Server }                        from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
-import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { ListToolsRequestSchema, CallToolRequestSchema, EmptyResultSchema } from '@modelcontextprotocol/sdk/types.js'
 import { createServer }                  from 'node:http'
 import { fileURLToPath }                 from 'node:url'
 import fs                                from 'node:fs'
@@ -978,24 +978,19 @@ export function createAppServer() {
           const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
             onsessioninitialized: (sid) => {
-              // KEEPALIVE: send a heartbeat notification every 25s so the SSE/HTTP
-              // streaming connection doesn't go idle long enough for proxies / kernel
-              // TCP keepalive / Claude Code MCP harness to mark it dropped. Cleared on close.
+              // KEEPALIVE: per MCP spec utilities/ping — server-initiated ping every 25s.
+              // Standard JSON-RPC request, client responds with empty result. Per spec:
+              // "Implementations SHOULD periodically issue pings to detect connection health"
+              // and "Multiple failed pings MAY trigger connection reset."
+              // Ref: https://modelcontextprotocol.info/specification/draft/basic/utilities/ping/
               const heartbeat = setInterval(async () => {
                 try {
-                  await mcpServer.notification({
-                    method: 'notifications/message',
-                    params: {
-                      level: 'debug',
-                      logger: 'keepalive',
-                      data: { ts: new Date().toISOString(), session: sid.slice(0,8) }
-                    }
-                  })
+                  await mcpServer.request({ method: 'ping' }, EmptyResultSchema)
                   counters.mcp_keepalives_sent = (counters.mcp_keepalives_sent || 0) + 1
                 } catch (e) {
-                  // Transport closed under us — log + clear, onclose handles the rest
                   counters.mcp_keepalives_failed = (counters.mcp_keepalives_failed || 0) + 1
-                  dlog('DEBUG', 'mcp-keepalive', `session=${sid.slice(0,8)} err=${e.message}`)
+                  dlog('WARN', 'mcp-ping', `session=${sid.slice(0,8)} err=${e.message}`)
+                  // Spec-blessed: treat timeout / repeated failure as a dead connection
                   clearInterval(heartbeat)
                 }
               }, 25_000)
