@@ -67,6 +67,17 @@ describe('GET /health', () => {
     assert.equal(typeof json.agents, 'number')
     assert.equal(typeof json.tasks, 'number')
   })
+
+  test('includes connected_clients array (per #251 acceptance)', async () => {
+    const { json } = await get(`${base}/health`)
+    assert.ok(Array.isArray(json.connected_clients), 'connected_clients must be an array')
+    // Each entry has the shape Wolf needs to spot dead persona clients.
+    for (const c of json.connected_clients) {
+      assert.equal(typeof c.session_id, 'string')
+      assert.ok('connected_at' in c)
+      assert.ok('last_pong_at' in c)
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
