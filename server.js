@@ -1184,6 +1184,66 @@ export function createAppServer() {
     if (req.url === '/mcp') {
       const sessionId = req.headers['mcp-session-id']
 
+      // Build a fresh MCP session bound to either a client-provided session_id
+      // (resurrecting an unknown one) or a freshly-generated UUID. Returns the
+      // transport ready to handleRequest. We adopt unknown ids so a client whose
+      // server-side session was lost (restart, eviction) "just works" on next
+      // call — no 404/reinit dance the SDK won't reliably perform.
+      const buildSession = (preferredId) => {
+        const idForGenerator = preferredId || crypto.randomUUID()
+        let mcpServer
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => idForGenerator,
+          onsessioninitialized: (sid) => {
+            // KEEPALIVE: per MCP spec utilities/ping — every 25s.
+            // Before the failStreak counter, clearInterval() stopped pinging
+            // but left the session in mcpSessions — every broadcast fanned to
+            // dead sockets and Smiley/Mike saw "channel went silent".
+            let failStreak = 0
+            const MAX_FAILS = 3   // ~75s unresponsive before eviction
+            const heartbeat = setInterval(async () => {
+              try {
+                await mcpServer.request({ method: 'ping' }, EmptyResultSchema)
+                counters.mcp_keepalives_sent = (counters.mcp_keepalives_sent || 0) + 1
+                failStreak = 0
+                const sess = mcpSessions.get(sid)
+                if (sess) sess.last_pong_at = new Date().toISOString()
+              } catch (e) {
+                counters.mcp_keepalives_failed = (counters.mcp_keepalives_failed || 0) + 1
+                failStreak++
+                dlog('WARN', 'mcp-ping', `session=${sid.slice(0,8)} fail=${failStreak}/${MAX_FAILS} err=${e.message}`)
+                if (failStreak >= MAX_FAILS) {
+                  clearInterval(heartbeat)
+                  counters.mcp_sessions_evicted = (counters.mcp_sessions_evicted || 0) + 1
+                  dlog('WARN', 'mcp', `evicting dead session ${sid.slice(0,8)} after ${failStreak} failed pings`)
+                  try { await transport.close() } catch (closeErr) {
+                    dlog('WARN', 'mcp', `transport.close err for ${sid.slice(0,8)}: ${closeErr.message}`)
+                    if (mcpSessions.has(sid)) {
+                      mcpSessions.delete(sid)
+                      dlog('INFO', 'mcp', `forced delete ${sid.slice(0,8)} (total=${mcpSessions.size})`)
+                    }
+                  }
+                }
+              }
+            }, 25_000)
+            mcpSessions.set(sid, { transport, server: mcpServer, heartbeat, connected_at: new Date().toISOString(), last_pong_at: null, remote: req.socket?.remoteAddress || null })
+            const reused = preferredId === sid ? ' (RESURRECTED stale id)' : ''
+            dlog('INFO', 'mcp', `session init ${sid.slice(0,8)} (total=${mcpSessions.size})${reused}`)
+          },
+        })
+        transport.onclose = () => {
+          const sid = transport.sessionId
+          if (sid) {
+            const sess = mcpSessions.get(sid)
+            if (sess?.heartbeat) clearInterval(sess.heartbeat)
+            mcpSessions.delete(sid)
+            dlog('INFO', 'mcp', `session closed ${sid.slice(0,8)} (total=${mcpSessions.size})`)
+          }
+        }
+        mcpServer = createMcpServer()
+        return { transport, ready: mcpServer.connect(transport) }
+      }
+
       if (req.method === 'POST') {
         let body = ''
         req.on('data', c => { body += c })
@@ -1193,80 +1253,35 @@ export function createAppServer() {
 
         if (sessionId && mcpSessions.has(sessionId)) {
           await mcpSessions.get(sessionId).transport.handleRequest(req, res, parsedBody)
-        } else if (!sessionId) {
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => crypto.randomUUID(),
-            onsessioninitialized: (sid) => {
-              // KEEPALIVE: per MCP spec utilities/ping — server-initiated ping every 25s.
-              // Standard JSON-RPC request, client responds with empty result. Per spec:
-              // "Implementations SHOULD periodically issue pings to detect connection health"
-              // and "Multiple failed pings MAY trigger connection reset."
-              // Ref: https://modelcontextprotocol.info/specification/draft/basic/utilities/ping/
-              // Track consecutive ping failures so we can evict a session that goes silent.
-              // Before this, clearInterval() stopped pinging but left the session in mcpSessions —
-              // every broadcast then fanned out to dead sockets and Smiley/Mike saw "channel went silent".
-              let failStreak = 0
-              const MAX_FAILS = 3   // ~75s of unresponsive pings before eviction
-              const heartbeat = setInterval(async () => {
-                try {
-                  await mcpServer.request({ method: 'ping' }, EmptyResultSchema)
-                  counters.mcp_keepalives_sent = (counters.mcp_keepalives_sent || 0) + 1
-                  failStreak = 0
-                  const sess = mcpSessions.get(sid)
-                  if (sess) sess.last_pong_at = new Date().toISOString()
-                } catch (e) {
-                  counters.mcp_keepalives_failed = (counters.mcp_keepalives_failed || 0) + 1
-                  failStreak++
-                  dlog('WARN', 'mcp-ping', `session=${sid.slice(0,8)} fail=${failStreak}/${MAX_FAILS} err=${e.message}`)
-                  if (failStreak >= MAX_FAILS) {
-                    clearInterval(heartbeat)
-                    counters.mcp_sessions_evicted = (counters.mcp_sessions_evicted || 0) + 1
-                    dlog('WARN', 'mcp', `evicting dead session ${sid.slice(0,8)} after ${failStreak} failed pings`)
-                    // Close the transport — its onclose handler will delete from mcpSessions.
-                    try { await transport.close() } catch (closeErr) {
-                      dlog('WARN', 'mcp', `transport.close err for ${sid.slice(0,8)}: ${closeErr.message}`)
-                      // Fall back to manual cleanup if close didn't fire onclose.
-                      if (mcpSessions.has(sid)) {
-                        mcpSessions.delete(sid)
-                        dlog('INFO', 'mcp', `forced delete ${sid.slice(0,8)} (total=${mcpSessions.size})`)
-                      }
-                    }
-                  }
-                }
-              }, 25_000)
-              mcpSessions.set(sid, { transport, server: mcpServer, heartbeat, connected_at: new Date().toISOString(), last_pong_at: null, remote: req.socket?.remoteAddress || null })
-              dlog('INFO', 'mcp', `session init ${sid.slice(0,8)} (total=${mcpSessions.size}, keepalive=25s, evict-after=${MAX_FAILS}-fails)`)
-            },
-          })
-          let mcpServer
-          transport.onclose = () => {
-            const sid = transport.sessionId
-            if (sid) {
-              const sess = mcpSessions.get(sid)
-              if (sess?.heartbeat) clearInterval(sess.heartbeat)
-              mcpSessions.delete(sid)
-              dlog('INFO', 'mcp', `session closed ${sid.slice(0,8)} (total=${mcpSessions.size})`)
-            }
-          }
-          mcpServer = createMcpServer()
-          await mcpServer.connect(transport)
-          await transport.handleRequest(req, res, parsedBody)
         } else {
-          // Per MCP Streamable HTTP spec, a 404 on an unknown session_id tells
-          // the client its session is gone (e.g. after a server restart) and it
-          // must reinitialize. Returning 400 used to leave the client stuck.
-          res.writeHead(404, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Unknown session ID — reinitialize' }))
-          dlog('INFO', 'mcp', `stale session ${String(sessionId).slice(0,8)} → 404 (client will reinit)`)
+          // No session_id OR unknown session_id: adopt the provided id (or
+          // mint a fresh one). For an unknown id the SDK client thinks its
+          // session is still alive — let it be right.
+          if (sessionId) {
+            counters.mcp_sessions_resurrected = (counters.mcp_sessions_resurrected || 0) + 1
+            dlog('INFO', 'mcp', `resurrecting stale POST session ${sessionId.slice(0,8)}`)
+          }
+          const { transport, ready } = buildSession(sessionId)
+          await ready
+          await transport.handleRequest(req, res, parsedBody)
         }
         return
       }
       if (req.method === 'GET') {
         if (sessionId && mcpSessions.has(sessionId)) {
           await mcpSessions.get(sessionId).transport.handleRequest(req, res)
+        } else if (sessionId) {
+          // Unknown GET session — adopt and start its notification stream.
+          counters.mcp_sessions_resurrected = (counters.mcp_sessions_resurrected || 0) + 1
+          dlog('INFO', 'mcp', `resurrecting stale GET session ${sessionId.slice(0,8)}`)
+          const { transport, ready } = buildSession(sessionId)
+          await ready
+          await transport.handleRequest(req, res)
         } else {
+          // GET with no session_id is genuinely invalid (notification stream
+          // needs an id to bind to). Keep this 404.
           res.writeHead(404, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Invalid or missing session ID — reinitialize' }))
+          res.end(JSON.stringify({ error: 'Missing session ID' }))
         }
         return
       }
