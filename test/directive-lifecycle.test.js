@@ -15,6 +15,7 @@ import {
   indexDirective, findDirective, setDirectiveStatus,
   directiveStatusReport, listDirectives, peekInbox,
   hasLiveMcpFromWakeupHost,
+  resolveTargetSession,
 } from '../server.js'
 
 function newDirective(over = {}) {
@@ -178,6 +179,78 @@ describe('listDirectives', () => {
   test('returns newest first', () => {
     const r = listDirectives({})
     assert.deepEqual(r.map(d => d.directive_id), ['d3', 'd2', 'd1'])
+  })
+})
+
+describe('resolveTargetSession (persona-aware routing)', () => {
+  beforeEach(() => {
+    registry.clear()
+    mcpSessions.clear()
+  })
+
+  test('returns null for missing input', () => {
+    assert.equal(resolveTargetSession(null), null)
+    assert.equal(resolveTargetSession(''), null)
+    assert.equal(resolveTargetSession('unknown-id'), null)
+  })
+
+  test('returns live session id when it is itself live', () => {
+    registry.set('mike-20260602', { persona: 'mike', kind: null })
+    mcpSessions.set('mike-20260602', { remote: '192.168.1.231' })
+    assert.equal(resolveTargetSession('mike-20260602'), 'mike-20260602')
+  })
+
+  test('routes persona shorthand "mike" to live MCP session, not placeholder', () => {
+    registry.set('mike-persistent',  { persona: 'mike', kind: 'wakeup_only' })
+    registry.set('mike-20260602',    { persona: 'mike', kind: null, last_status_at: '2026-06-02T20:30:17Z' })
+    mcpSessions.set('mike-20260602', { remote: '192.168.1.231' })
+    assert.equal(resolveTargetSession('mike'), 'mike-20260602')
+  })
+
+  test('routes persistent placeholder "mike-persistent" to live session for same persona', () => {
+    registry.set('mike-persistent',  { persona: 'mike', kind: 'wakeup_only' })
+    registry.set('mike-20260602',    { persona: 'mike', kind: null, last_status_at: '2026-06-02T20:30:17Z' })
+    mcpSessions.set('mike-20260602', { remote: '192.168.1.231' })
+    assert.equal(resolveTargetSession('mike-persistent'), 'mike-20260602')
+  })
+
+  test('falls back to placeholder when no live session for the persona', () => {
+    registry.set('mike-persistent', { persona: 'mike', kind: 'wakeup_only' })
+    assert.equal(resolveTargetSession('mike'), 'mike-persistent')
+    assert.equal(resolveTargetSession('mike-persistent'), 'mike-persistent')
+  })
+
+  test('picks most-recently-active when multiple live sessions match', () => {
+    registry.set('mike-old', { persona: 'mike', kind: null, last_status_at: '2026-06-01T10:00:00Z' })
+    registry.set('mike-new', { persona: 'mike', kind: null, last_status_at: '2026-06-02T20:00:00Z' })
+    mcpSessions.set('mike-old', { remote: '192.168.1.231' })
+    mcpSessions.set('mike-new', { remote: '192.168.1.231' })
+    assert.equal(resolveTargetSession('mike'), 'mike-new')
+  })
+
+  test('skips wakeup_only entries when looking for live sessions', () => {
+    registry.set('mike-persistent',  { persona: 'mike', kind: 'wakeup_only', last_status_at: '2026-06-02T21:00:00Z' })
+    mcpSessions.set('mike-persistent', { remote: '192.168.1.231' })
+    // wakeup_only is a placeholder — never a live target. Should fall back to itself
+    // (or null if no other option), but never claim itself as "live".
+    // Here it's also the placeholder, so we expect "mike-persistent" as final fallback.
+    assert.equal(resolveTargetSession('mike'), 'mike-persistent')
+  })
+
+  test('skips dead (non-live) registry entries even with matching persona', () => {
+    registry.set('mike-persistent', { persona: 'mike', kind: 'wakeup_only' })
+    registry.set('mike-dead',       { persona: 'mike', kind: null })  // not in mcpSessions
+    assert.equal(resolveTargetSession('mike'), 'mike-persistent')
+  })
+
+  test('persona resolution is case/exact-match — does not cross personas', () => {
+    registry.set('mike-live',  { persona: 'mike',   kind: null, last_status_at: '2026-06-02T20:00:00Z' })
+    registry.set('smily-live', { persona: 'smiley', kind: null, last_status_at: '2026-06-02T20:00:00Z' })
+    mcpSessions.set('mike-live', { remote: '192.168.1.231' })
+    mcpSessions.set('smily-live', { remote: '192.168.1.186' })
+    assert.equal(resolveTargetSession('mike'), 'mike-live')
+    assert.equal(resolveTargetSession('smiley'), 'smily-live')
+    assert.equal(resolveTargetSession('Mike'), null)  // case-sensitive miss
   })
 })
 

@@ -218,6 +218,61 @@ export function peekInbox(session_id) {
     .map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at, status: d.status ?? 'pending' }))
 }
 
+// Persona routing — when send_directive targets a persona ("mike", "smiley") or
+// a persistent placeholder ("mike-persistent"), prefer delivery to a LIVE MCP
+// session for that persona over the placeholder inbox. Otherwise REST-cron
+// pollers on the remote box silently drain the placeholder while the persona's
+// actual LLM-driven CLI session sits polling its own empty inbox.
+//
+// Returns the session_id that should actually receive the directive (or null
+// if nothing matches). Falls back to the placeholder if no live session.
+export function resolveTargetSession(requestedId) {
+  if (!requestedId) return null
+
+  // Helper: a session is "live" if it has an active MCP transport.
+  const isLive = (sid) => mcpSessions.has(sid)
+
+  // Pick the most-recently-active live MCP session whose registry entry has
+  // persona === target. Skip placeholder entries (kind=wakeup_only) — they're
+  // bookkeeping rows, never the actual MCP-connected CLI.
+  const findLiveByPersona = (persona) => {
+    let best = null, bestTs = ''
+    for (const [sid, entry] of registry.entries()) {
+      if (entry.persona !== persona) continue
+      if (entry.kind === 'wakeup_only') continue
+      if (!isLive(sid)) continue
+      const ts = entry.last_status_at || entry.started_at || ''
+      if (ts >= bestTs) { best = sid; bestTs = ts }
+    }
+    return best
+  }
+
+  // Case 1: requestedId is itself a live MCP session — deliver directly.
+  if (isLive(requestedId)) return requestedId
+
+  // Case 2: requestedId is a persona shorthand (e.g. "mike").
+  if (!registry.has(requestedId)) {
+    const live = findLiveByPersona(requestedId)
+    if (live) return live
+    const placeholder = `${requestedId}-persistent`
+    if (registry.has(placeholder)) return placeholder
+    // Legacy fall-through: any wakeup_only entry with matching persona.
+    for (const [sid, entry] of registry.entries()) {
+      if (entry.persona === requestedId && entry.wakeup_url) return sid
+    }
+    return null
+  }
+
+  // Case 3: requestedId is registered. If it has a persona field, prefer that
+  // persona's LIVE session over the placeholder we were asked to hit.
+  const entry = registry.get(requestedId)
+  if (entry.persona) {
+    const live = findLiveByPersona(entry.persona)
+    if (live && live !== requestedId) return live
+  }
+  return requestedId
+}
+
 // Persona-scoped event queues for HTTP long-poll / streaming delivery.
 // Keyed by persona name (e.g. 'wolf'), independent of MCP transport lifecycle.
 export const personaQueues   = new Map()  // persona -> [{ id, body, ts }]
@@ -984,9 +1039,14 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
     }
 
     if (name === 'send_directive') {
-      const { session_id, type, body, from_session } = args
-      if (!registry.has(session_id))
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'session_not_found' }) }] }
+      const { session_id: requested, type, body, from_session } = args
+      const session_id = resolveTargetSession(requested)
+      if (!session_id || !registry.has(session_id))
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'session_not_found', requested }) }] }
+      if (session_id !== requested) {
+        counters.persona_routed = (counters.persona_routed || 0) + 1
+        dlog('INFO', 'route', `persona ${requested} → live session ${session_id.slice(0,8)}`)
+      }
       const directive = {
         id: crypto.randomUUID(), type, body,
         sent_at: new Date().toISOString(), delivered: false,
@@ -1628,9 +1688,11 @@ export function createAppServer() {
           res.end(JSON.stringify({ error: 'missing session_id (or to/persona)' })); return
         }
         autoRegister(session_id, 'HTTP /check-inbox')
+        const peek = payload.peek === true || payload.peek === 'true'
         const pending = (inboxes.get(session_id) ?? []).filter(d => !d.delivered)
-        for (const d of pending) d.delivered = true
-        process.stderr.write(`[calling-all-stations] HTTP check-inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
+        if (!peek) for (const d of pending) d.delivered = true
+        const verb = peek ? 'peek-inbox' : 'check-inbox'
+        process.stderr.write(`[calling-all-stations] HTTP ${verb} ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ directives: pending.map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at })) }))
         return
@@ -1687,7 +1749,7 @@ export function createAppServer() {
       if (req.url === '/send-directive' || req.url === '/send_directive') {
         // Accept both the canonical {session_id, type, body} and the more natural
         // {to, type, text|message|body, from} shape that remote agents tend to guess.
-        let session_id = payload.session_id || payload.to
+        const requested = payload.session_id || payload.to
         const type = payload.type || 'message'
         let directiveBody = payload.body
         if (!directiveBody) {
@@ -1695,26 +1757,19 @@ export function createAppServer() {
             directiveBody = { from: payload.from || 'unknown', message: payload.text || payload.message }
           }
         }
-        if (!session_id || !directiveBody) {
+        if (!requested || !directiveBody) {
           res.writeHead(400, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: false, error: 'missing session_id (or to), and body (or text/message)' })); return
         }
-        // Persona resolution: if session_id isn't found, try <persona>-persistent, then
-        // look up by persona field. Remote agents tend to guess "wolf" / "mike" instead
-        // of the full session id, and we should route them rather than 404.
-        if (!registry.has(session_id)) {
-          const personaCandidate = `${session_id}-persistent`
-          if (registry.has(personaCandidate)) {
-            session_id = personaCandidate
-          } else {
-            for (const [sid, entry] of registry.entries()) {
-              if (entry.persona === session_id && entry.wakeup_url) { session_id = sid; break }
-            }
-          }
-        }
-        if (!registry.has(session_id)) {
+        // Persona routing — prefer live MCP session for the persona over placeholder.
+        let session_id = resolveTargetSession(requested)
+        if (!session_id || !registry.has(session_id)) {
           res.writeHead(404, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ ok: false, error: 'session_not_found' })); return
+          res.end(JSON.stringify({ ok: false, error: 'session_not_found', requested })); return
+        }
+        if (session_id !== requested) {
+          counters.persona_routed = (counters.persona_routed || 0) + 1
+          dlog('INFO', 'route', `HTTP persona ${requested} → live session ${session_id.slice(0,8)}`)
         }
         const directive = {
           id: crypto.randomUUID(), type, body: directiveBody,

@@ -793,6 +793,21 @@ describe('Existing REST endpoints still work', () => {
     assert.equal(inbox.json.directives[0].body.text, 'hello')
   })
 
+  test('REST /check-inbox with peek=true does NOT mark directives delivered', async () => {
+    await post(`${base}/register`, { session_id: 'peek-1', label: 'PeekAgent' })
+    await post(`${base}/send-directive`, { session_id: 'peek-1', type: 'message', body: { text: 'do not consume me' } })
+    const peeked = await post(`${base}/check-inbox`, { session_id: 'peek-1', peek: true })
+    assert.equal(peeked.json.directives.length, 1)
+    // Peek must not flip delivered. Calling again should still return the same item.
+    const peekedAgain = await post(`${base}/check-inbox`, { session_id: 'peek-1', peek: true })
+    assert.equal(peekedAgain.json.directives.length, 1, 'peek must be idempotent')
+    // A real check-inbox (no peek) consumes.
+    const consumed = await post(`${base}/check-inbox`, { session_id: 'peek-1' })
+    assert.equal(consumed.json.directives.length, 1)
+    const afterConsume = await post(`${base}/check-inbox`, { session_id: 'peek-1', peek: true })
+    assert.equal(afterConsume.json.directives.length, 0, 'real check-inbox marks delivered')
+  })
+
   test('REST /send-directive populates directiveIndex (so get_directive_status finds it)', async () => {
     const { directiveIndex } = await import('../server.js')
     directiveIndex.clear()
