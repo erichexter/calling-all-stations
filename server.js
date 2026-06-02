@@ -971,6 +971,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
             blocking:   { type: 'boolean', description: 'true for agent_question — signals you will poll check_inbox for an answer' },
             step:       { type: 'string', description: 'Current step label (updates your registry entry)' },
             task_id:    { type: 'string', description: 'Active task ID — if provided with agent_question+blocking, task moves to input_required state' },
+            persona:    { type: 'string', description: 'Tag your live MCP session with a persona (mike, smiley, gus, etc) so send_directive can route to you by name. Set this once on session start.' },
           },
           required: ['event', 'session_id'],
         },
@@ -1124,11 +1125,19 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
     }
 
     if (name === 'send') {
-      const { event: eventType, session_id, message, question, blocking, step, task_id } = args
+      const { event: eventType, session_id, message, question, blocking, step, task_id, persona } = args
       autoRegister(session_id, `MCP send(${eventType})`)
       const entry = registry.get(session_id)
       if (entry) {
         if (step) { entry.current_step = step; entry.last_status_at = new Date().toISOString() }
+        // Persona tagging — once set on a session, send_directive(persona) can route here.
+        // Idempotent: re-sending the same persona is a no-op.
+        if (persona && entry.persona !== persona) {
+          entry.persona = persona
+          entry.last_status_at = new Date().toISOString()
+          dlog('INFO', 'persona', `tagged session ${session_id.slice(0,8)} → persona=${persona}`)
+          persistState()
+        }
         if (eventType === 'agent_question' && blocking) {
           entry.waiting_for_answer = true
           entry.question    = question ?? null
@@ -1842,12 +1851,20 @@ export function createAppServer() {
         return
       }
 
-      if (req.url === '/status') {
-        const { session_id, step } = payload
-        if (session_id && registry.has(session_id)) {
+      if (req.url === '/status' || req.url === '/agent_status') {
+        const { session_id, step, persona } = payload
+        if (session_id) {
+          autoRegister(session_id, 'HTTP /status')
           const entry = registry.get(session_id)
-          entry.current_step = step
-          entry.last_status_at = new Date().toISOString()
+          if (entry) {
+            if (step) { entry.current_step = step }
+            if (persona && entry.persona !== persona) {
+              entry.persona = persona
+              dlog('INFO', 'persona', `HTTP tagged session ${session_id.slice(0,8)} → persona=${persona}`)
+            }
+            entry.last_status_at = new Date().toISOString()
+            persistState()
+          }
         }
         res.writeHead(204); res.end(); return
       }
