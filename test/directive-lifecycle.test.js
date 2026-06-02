@@ -10,9 +10,11 @@ import { test, describe, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   registry, inboxes, tasks, directiveIndex,
+  mcpSessions,
   DIRECTIVE_STATUSES, DIRECTIVE_TERMINAL,
   indexDirective, findDirective, setDirectiveStatus,
   directiveStatusReport, listDirectives, peekInbox,
+  hasLiveMcpFromWakeupHost,
 } from '../server.js'
 
 function newDirective(over = {}) {
@@ -176,6 +178,42 @@ describe('listDirectives', () => {
   test('returns newest first', () => {
     const r = listDirectives({})
     assert.deepEqual(r.map(d => d.directive_id), ['d3', 'd2', 'd1'])
+  })
+})
+
+describe('hasLiveMcpFromWakeupHost (channel-vs-wakeup gating)', () => {
+  beforeEach(() => { mcpSessions.clear() })
+
+  test('false when no MCP sessions exist at all', () => {
+    assert.equal(hasLiveMcpFromWakeupHost('http://192.168.1.231:19001/directive'), false)
+  })
+
+  test('false when no session originates from the wakeup_url host', () => {
+    mcpSessions.set('a', { remote: '192.168.1.99', server: {}, transport: {} })
+    assert.equal(hasLiveMcpFromWakeupHost('http://192.168.1.231:19001/directive'), false)
+  })
+
+  test('true when an MCP session is alive from the wakeup_url host', () => {
+    mcpSessions.set('a', { remote: '192.168.1.231', server: {}, transport: {} })
+    assert.equal(hasLiveMcpFromWakeupHost('http://192.168.1.231:19001/directive'), true)
+  })
+
+  test('handles IPv4-mapped IPv6 (::ffff:192.168.1.231 → 192.168.1.231)', () => {
+    mcpSessions.set('a', { remote: '::ffff:192.168.1.231', server: {}, transport: {} })
+    assert.equal(hasLiveMcpFromWakeupHost('http://192.168.1.231:19001/directive'), true)
+  })
+
+  test('false on garbage wakeup_url', () => {
+    mcpSessions.set('a', { remote: '192.168.1.231', server: {}, transport: {} })
+    assert.equal(hasLiveMcpFromWakeupHost('not a url'), false)
+    assert.equal(hasLiveMcpFromWakeupHost(null), false)
+    assert.equal(hasLiveMcpFromWakeupHost(undefined), false)
+  })
+
+  test('ignores sessions with no remote field', () => {
+    mcpSessions.set('a', { remote: null, server: {}, transport: {} })
+    mcpSessions.set('b', { server: {}, transport: {} })
+    assert.equal(hasLiveMcpFromWakeupHost('http://192.168.1.231:19001/directive'), false)
   })
 })
 

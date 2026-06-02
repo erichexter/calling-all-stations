@@ -778,7 +778,8 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
 // MCP session management
 // ---------------------------------------------------------------------------
 
-const mcpSessions = new Map()
+// Exported only for test access — production callers go through the helpers below.
+export const mcpSessions = new Map()
 
 export function broadcastNotification(method, params) {
   for (const [, { server }] of mcpSessions) {
@@ -786,6 +787,23 @@ export function broadcastNotification(method, params) {
     // The .catch() is required — an unhandled rejection here crashes the process.
     try { server.notification({ method, params }).catch(() => {}) } catch {}
   }
+}
+
+// Does any currently-connected MCP session originate from the same host as this
+// wakeup_url? Used to suppress the legacy wakeup-HTTP path when the persistent
+// CLI on that box is already MCP-connected — channel push covers it, the
+// hook-agent spawn would be redundant doubled delivery.
+export function hasLiveMcpFromWakeupHost(wakeup_url) {
+  if (!wakeup_url) return false
+  let host
+  try { host = new URL(wakeup_url).hostname } catch { return false }
+  for (const [, sess] of mcpSessions) {
+    if (!sess.remote) continue
+    // socket.remoteAddress may be IPv4-mapped IPv6 like ::ffff:192.168.1.231
+    const remote = sess.remote.replace(/^::ffff:/, '')
+    if (remote === host) return true
+  }
+  return false
 }
 
 function createMcpServer() {
@@ -1007,14 +1025,13 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
           type,
         },
       })
-      // Wake-up dispatch: if target is wakeup_only with a wakeup_url, POST the directive so
-      // the remote hook-agent fires immediately instead of waiting for a check_inbox poll
-      // that will never come. Fire-and-forget; client already has its directive_id.
-      // We coerce the directive body to a plain string before posting, because remote
-      // hook-agents (e.g. mike-hook-agent.js) do `${directive}` string interpolation —
-      // an unstringified object becomes "[object Object]". Prefer .message > .task >
-      // .instruction > JSON.stringify(whole body).
-      if (entry && entry.wakeup_url && entry.kind === 'wakeup_only') {
+      // Wake-up dispatch: legacy escape hatch for personas whose persistent CLI is
+      // NOT MCP-connected. If there is already an active MCP session from the same
+      // remote host as the wakeup_url, the channel-push above is sufficient — firing
+      // wakeup-HTTP too causes doubled delivery (channel event + hook-agent spawn).
+      // This auto-retires the wakeup path the moment a persistent CLI is alive, without
+      // requiring the persona's startup script to drop the wakeup_url registration.
+      if (entry && entry.wakeup_url && entry.kind === 'wakeup_only' && !hasLiveMcpFromWakeupHost(entry.wakeup_url)) {
         counters.wakeups_attempted++; counters.directives_sent++
         dlog('DEBUG', 'wakeup-mcp', { target: session_id.slice(0,8), url: entry.wakeup_url, type })
         const directiveText = typeof body === 'string'
@@ -1719,8 +1736,9 @@ export function createAppServer() {
             type,
           },
         })
-        // Wake-up dispatch (same as MCP send_directive path)
-        if (entry && entry.wakeup_url && entry.kind === 'wakeup_only') {
+        // Wake-up dispatch (same as MCP send_directive path) — skip when a live
+        // MCP session already exists from the wakeup_url host (channel-push covers it).
+        if (entry && entry.wakeup_url && entry.kind === 'wakeup_only' && !hasLiveMcpFromWakeupHost(entry.wakeup_url)) {
           const directiveText = typeof directiveBody === 'string'
             ? directiveBody
             : (directiveBody && (directiveBody.message || directiveBody.task || directiveBody.instruction)) || JSON.stringify(directiveBody)
