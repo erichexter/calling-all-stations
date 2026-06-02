@@ -814,6 +814,8 @@ function createMcpServer() {
       instructions: `Calling-all-stations is a multi-agent coordination server supporting MCP and A2A.
 
 When you receive a <channel source="calling-all-stations"> notification:
+- event="directive_sent": a directive was queued for an agent. If meta.to_session matches your session_id (or your persona), call check_inbox IMMEDIATELY, then act on the directive. Other agents ignore.
+- event="directive_status": a directive's lifecycle status changed (pending/delivered/read/accepted/completed/failed/rejected). The dispatcher (e.g. Wolf) uses this to track work without polling.
 - event="agent_status": log the update; the sending agent changed step.
 - event="agent_question": an agent needs an answer. Call send_directive with type="answer" immediately.
 - event="agent_response": an A2A task was completed by an agent. Mark the task done.
