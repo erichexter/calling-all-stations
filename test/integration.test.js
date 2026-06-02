@@ -793,6 +793,21 @@ describe('Existing REST endpoints still work', () => {
     assert.equal(inbox.json.directives[0].body.text, 'hello')
   })
 
+  test('REST /send-directive populates directiveIndex (so get_directive_status finds it)', async () => {
+    const { directiveIndex } = await import('../server.js')
+    directiveIndex.clear()
+    await post(`${base}/register`, { session_id: 'rest-idx', label: 'IndexAgent' })
+    const { json } = await post(`${base}/send-directive`, {
+      session_id: 'rest-idx', type: 'message', body: { text: 'index me' }, from: 'wolf',
+    })
+    assert.ok(json.directive_id, 'directive_id returned')
+    const stored = directiveIndex.get(json.directive_id)
+    assert.ok(stored, 'directive must be in the index — wolf can query its lifecycle')
+    assert.equal(stored.to_session, 'rest-idx')
+    assert.equal(stored.from_session, 'wolf')
+    assert.equal(stored.status, 'pending')
+  })
+
   test('DELETE /deregister/:id removes agent', async () => {
     await post(`${base}/register`, { session_id: 'del-1', label: 'Delete Me' })
     assert.ok(registry.has('del-1'))

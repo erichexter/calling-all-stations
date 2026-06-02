@@ -990,6 +990,23 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       }
       persistState()
       process.stderr.write(`[calling-all-stations] directive -> ${session_id.slice(0,8)}: ${type}\n`)
+      // Channel push so a persistent MCP-connected recipient gets a real-time
+      // signal to call check_inbox — without this they'd only see the directive
+      // on their next poll, which is how Smiley/Mike "went silent" in the first
+      // place. Broadcast scope is intentional (every session sees it); the meta
+      // includes to_session so each client can filter.
+      broadcastNotification('notifications/message', {
+        content: `<channel source="calling-all-stations">directive ${directive.id.slice(0, 8)} for ${session_id.slice(0, 8)} (${type})</channel>`,
+        meta: {
+          message_id: `m${Date.now()}-${++seq}`,
+          ts: new Date().toISOString(),
+          event: 'directive_sent',
+          directive_id: directive.id,
+          to_session: session_id,
+          from: from_session ?? null,
+          type,
+        },
+      })
       // Wake-up dispatch: if target is wakeup_only with a wakeup_url, POST the directive so
       // the remote hook-agent fires immediately instead of waiting for a check_inbox poll
       // that will never come. Fire-and-forget; client already has its directive_id.
@@ -1216,8 +1233,12 @@ export function createAppServer() {
           await mcpServer.connect(transport)
           await transport.handleRequest(req, res, parsedBody)
         } else {
-          res.writeHead(400, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Unknown session ID' }))
+          // Per MCP Streamable HTTP spec, a 404 on an unknown session_id tells
+          // the client its session is gone (e.g. after a server restart) and it
+          // must reinitialize. Returning 400 used to leave the client stuck.
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Unknown session ID — reinitialize' }))
+          dlog('INFO', 'mcp', `stale session ${String(sessionId).slice(0,8)} → 404 (client will reinit)`)
         }
         return
       }
@@ -1225,8 +1246,8 @@ export function createAppServer() {
         if (sessionId && mcpSessions.has(sessionId)) {
           await mcpSessions.get(sessionId).transport.handleRequest(req, res)
         } else {
-          res.writeHead(400, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Invalid or missing session ID' }))
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Invalid or missing session ID — reinitialize' }))
         }
         return
       }
@@ -1661,9 +1682,15 @@ export function createAppServer() {
           res.writeHead(404, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: false, error: 'session_not_found' })); return
         }
-        const directive = { id: crypto.randomUUID(), type, body: directiveBody, sent_at: new Date().toISOString(), delivered: false }
+        const directive = {
+          id: crypto.randomUUID(), type, body: directiveBody,
+          sent_at: new Date().toISOString(), delivered: false,
+          status: 'pending', status_history: [],
+          to_session: session_id, from_session: payload.from || payload.from_session || null,
+        }
         if (!inboxes.has(session_id)) inboxes.set(session_id, [])
         inboxes.get(session_id).push(directive)
+        indexDirective(session_id, directive)
         const entry = registry.get(session_id)
         if (type === 'answer' && entry) {
           entry.waiting_for_answer = false
@@ -1678,6 +1705,20 @@ export function createAppServer() {
         }
         persistState()
         process.stderr.write(`[calling-all-stations] HTTP send-directive -> ${session_id.slice(0,8)}: ${type}\n`)
+        // Parity with MCP send_directive: push a channel event so an MCP-connected
+        // recipient gets the real-time signal to check_inbox.
+        broadcastNotification('notifications/message', {
+          content: `<channel source="calling-all-stations">directive ${directive.id.slice(0, 8)} for ${session_id.slice(0, 8)} (${type})</channel>`,
+          meta: {
+            message_id: `m${Date.now()}-${++seq}`,
+            ts: new Date().toISOString(),
+            event: 'directive_sent',
+            directive_id: directive.id,
+            to_session: session_id,
+            from: directive.from_session,
+            type,
+          },
+        })
         // Wake-up dispatch (same as MCP send_directive path)
         if (entry && entry.wakeup_url && entry.kind === 'wakeup_only') {
           const directiveText = typeof directiveBody === 'string'
