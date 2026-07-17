@@ -61,7 +61,7 @@ function _maybeRotate() {
     _openLog()
   } catch (e) {}
 }
-setInterval(_maybeRotate, 60_000)
+setInterval(_maybeRotate, 60_000).unref()
 // Single structured logger — writes to BOTH stderr (for schtask capture if redirected) AND file
 export function dlog(level, scope, ...args) {
   const ts = new Date().toISOString()
@@ -106,6 +106,173 @@ export const registry = new Map()   // session_id -> agent_info
 export const inboxes  = new Map()   // session_id -> [directive, ...]
 export const tasks    = new Map()   // task_id    -> a2a task object
 
+// Directive registry — O(1) lookup of any send_directive dispatch by its id,
+// independent of which inbox it lives in. The stored object IS the same
+// reference held in the inbox array, so mutating status here updates both.
+// Rebuilt from inboxes on hydrateState(). Powers ack_directive /
+// get_directive_status / list_my_directives (issue #251 secondary bugs B + C).
+export const directiveIndex = new Map()  // directive_id -> directive object
+
+// Valid directive lifecycle states. `pending` (queued) and `delivered`
+// (returned by check_inbox) are set by the server; the rest are set by the
+// consumer via ack_directive so the dispatcher can see read/accept/finish.
+export const DIRECTIVE_STATUSES = new Set(['pending', 'delivered', 'read', 'accepted', 'completed', 'failed', 'rejected'])
+// Terminal directive states — dropped from persistence so in-flight state stays bounded.
+export const DIRECTIVE_TERMINAL = new Set(['completed', 'failed', 'rejected'])
+
+export function indexDirective(session_id, directive) {
+  if (!directive || !directive.id) return
+  // Stamp lifecycle fields on first sight without clobbering existing ones.
+  if (directive.status === undefined) directive.status = directive.delivered ? 'delivered' : 'pending'
+  if (!Array.isArray(directive.status_history)) directive.status_history = []
+  if (directive.to_session === undefined) directive.to_session = session_id
+  directiveIndex.set(directive.id, directive)
+}
+
+export function findDirective(directive_id) {
+  return directiveIndex.get(directive_id) ?? null
+}
+
+// Update a directive's lifecycle status, append to its history, persist, and
+// broadcast a `directive_status` channel event so the dispatcher (e.g. Wolf)
+// sees read/accepted/completed/failed transitions. Returns a result object.
+export function setDirectiveStatus(directive_id, status, note = null, by = null) {
+  if (!DIRECTIVE_STATUSES.has(status)) {
+    return { ok: false, error: `invalid_status:${status}`, valid: Array.from(DIRECTIVE_STATUSES) }
+  }
+  const directive = findDirective(directive_id)
+  if (!directive) return { ok: false, error: 'directive_not_found' }
+  const prev = directive.status
+  directive.status = status
+  directive.status_history.push({ status, note: note ?? null, by: by ?? null, at: new Date().toISOString() })
+  if (status === 'read' && !directive.read_at) directive.read_at = new Date().toISOString()
+  persistState()
+  // Channel event so any connected MCP session (Wolf) learns of the transition
+  // without polling. Mirrors the meta-shaped events emitted by `send`.
+  broadcastNotification('notifications/message', {
+    content: `<channel source="calling-all-stations">directive ${directive_id.slice(0, 8)} ${prev}->${status}</channel>`,
+    meta: {
+      message_id: `m${Date.now()}-${++seq}`,
+      ts: new Date().toISOString(),
+      event: 'directive_status',
+      directive_id,
+      to_session: directive.to_session ?? null,
+      from: directive.from_session ?? (directive.body && directive.body.from) ?? null,
+      type: directive.type ?? null,
+      prev_status: prev,
+      status,
+      note: note ?? null,
+    },
+  })
+  process.stderr.write(`[calling-all-stations] directive ${directive_id.slice(0, 8)} status ${prev} -> ${status}\n`)
+  return { ok: true, directive_id, status, prev_status: prev }
+}
+
+// Public view of a directive's status (get_directive_status).
+export function directiveStatusReport(directive_id) {
+  const d = findDirective(directive_id)
+  if (!d) return null
+  return {
+    directive_id: d.id,
+    to_session: d.to_session ?? null,
+    from: d.from_session ?? (d.body && d.body.from) ?? null,
+    type: d.type ?? null,
+    status: d.status ?? (d.delivered ? 'delivered' : 'pending'),
+    delivered: !!d.delivered,
+    sent_at: d.sent_at ?? null,
+    read_at: d.read_at ?? null,
+    status_history: Array.isArray(d.status_history) ? d.status_history : [],
+  }
+}
+
+// List directives, filterable by recipient (to_session), dispatcher
+// (from_session), and/or status. Backs list_my_directives.
+export function listDirectives({ to_session = null, from_session = null, status = null } = {}) {
+  const out = []
+  for (const d of directiveIndex.values()) {
+    if (to_session && (d.to_session ?? null) !== to_session) continue
+    if (from_session && (d.from_session ?? (d.body && d.body.from) ?? null) !== from_session) continue
+    const effStatus = d.status ?? (d.delivered ? 'delivered' : 'pending')
+    if (status && effStatus !== status) continue
+    out.push({
+      directive_id: d.id,
+      to_session: d.to_session ?? null,
+      from: d.from_session ?? (d.body && d.body.from) ?? null,
+      type: d.type ?? null,
+      status: effStatus,
+      delivered: !!d.delivered,
+      sent_at: d.sent_at ?? null,
+    })
+  }
+  // Newest first.
+  out.sort((a, b) => String(b.sent_at).localeCompare(String(a.sent_at)))
+  return out
+}
+
+// Return undelivered directives for a session WITHOUT marking them delivered
+// (peek_inbox). Fixes secondary bug A: check_inbox's consume-on-read meant a
+// peek by one reader hid the directive from the real consumer.
+export function peekInbox(session_id) {
+  return (inboxes.get(session_id) ?? [])
+    .filter(d => !d.delivered)
+    .map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at, status: d.status ?? 'pending' }))
+}
+
+// Persona routing — when send_directive targets a persona ("mike", "smiley") or
+// a persistent placeholder ("mike-persistent"), prefer delivery to a LIVE MCP
+// session for that persona over the placeholder inbox. Otherwise REST-cron
+// pollers on the remote box silently drain the placeholder while the persona's
+// actual LLM-driven CLI session sits polling its own empty inbox.
+//
+// Returns the session_id that should actually receive the directive (or null
+// if nothing matches). Falls back to the placeholder if no live session.
+export function resolveTargetSession(requestedId) {
+  if (!requestedId) return null
+
+  // Helper: a session is "live" if it has an active MCP transport.
+  const isLive = (sid) => mcpSessions.has(sid)
+
+  // Pick the most-recently-active live MCP session whose registry entry has
+  // persona === target. Skip placeholder entries (kind=wakeup_only) — they're
+  // bookkeeping rows, never the actual MCP-connected CLI.
+  const findLiveByPersona = (persona) => {
+    let best = null, bestTs = ''
+    for (const [sid, entry] of registry.entries()) {
+      if (entry.persona !== persona) continue
+      if (entry.kind === 'wakeup_only') continue
+      if (!isLive(sid)) continue
+      const ts = entry.last_status_at || entry.started_at || ''
+      if (ts >= bestTs) { best = sid; bestTs = ts }
+    }
+    return best
+  }
+
+  // Case 1: requestedId is itself a live MCP session — deliver directly.
+  if (isLive(requestedId)) return requestedId
+
+  // Case 2: requestedId is a persona shorthand (e.g. "mike").
+  if (!registry.has(requestedId)) {
+    const live = findLiveByPersona(requestedId)
+    if (live) return live
+    const placeholder = `${requestedId}-persistent`
+    if (registry.has(placeholder)) return placeholder
+    // Legacy fall-through: any wakeup_only entry with matching persona.
+    for (const [sid, entry] of registry.entries()) {
+      if (entry.persona === requestedId && entry.wakeup_url) return sid
+    }
+    return null
+  }
+
+  // Case 3: requestedId is registered. If it has a persona field, prefer that
+  // persona's LIVE session over the placeholder we were asked to hit.
+  const entry = registry.get(requestedId)
+  if (entry.persona) {
+    const live = findLiveByPersona(entry.persona)
+    if (live && live !== requestedId) return live
+  }
+  return requestedId
+}
+
 // Persona-scoped event queues for HTTP long-poll / streaming delivery.
 // Keyed by persona name (e.g. 'wolf'), independent of MCP transport lifecycle.
 export const personaQueues   = new Map()  // persona -> [{ id, body, ts }]
@@ -133,8 +300,14 @@ export function persistState() {
   try {
     const inboxSnapshot = {}
     for (const [id, directives] of inboxes) {
-      const pending = directives.filter(d => !d.delivered)
-      if (pending.length > 0) inboxSnapshot[id] = pending
+      // Persist anything still in-flight: undelivered directives (as before) AND
+      // delivered-but-not-finished ones, so ack/status/list_my_directives survive
+      // a server restart (issue #251). Terminal directives are dropped to stay bounded.
+      const live = directives.filter(d => {
+        const st = d.status ?? (d.delivered ? 'delivered' : 'pending')
+        return !DIRECTIVE_TERMINAL.has(st)
+      })
+      if (live.length > 0) inboxSnapshot[id] = live
     }
     fs.writeFileSync(STATE_FILE, JSON.stringify({
       registry: Object.fromEntries(registry),
@@ -155,10 +328,13 @@ export function hydrateState() {
         registry.set(id, { ...info, status: 'stale' })
     }
     if (state.inboxes) {
-      for (const [id, directives] of Object.entries(state.inboxes))
+      for (const [id, directives] of Object.entries(state.inboxes)) {
         inboxes.set(id, directives)
+        // Re-index every hydrated directive so ack/status/list survive a restart.
+        for (const d of directives) indexDirective(id, d)
+      }
     }
-    process.stderr.write(`[calling-all-stations] Hydrated ${registry.size} sessions from state\n`)
+    process.stderr.write(`[calling-all-stations] Hydrated ${registry.size} sessions, ${directiveIndex.size} directives from state\n`)
   } catch {}
 }
 
@@ -657,7 +833,8 @@ export function handleA2aRequest(payload, sessionId, baseUrl, options = {}) {
 // MCP session management
 // ---------------------------------------------------------------------------
 
-const mcpSessions = new Map()
+// Exported only for test access — production callers go through the helpers below.
+export const mcpSessions = new Map()
 
 export function broadcastNotification(method, params) {
   for (const [, { server }] of mcpSessions) {
@@ -665,6 +842,23 @@ export function broadcastNotification(method, params) {
     // The .catch() is required — an unhandled rejection here crashes the process.
     try { server.notification({ method, params }).catch(() => {}) } catch {}
   }
+}
+
+// Does any currently-connected MCP session originate from the same host as this
+// wakeup_url? Used to suppress the legacy wakeup-HTTP path when the persistent
+// CLI on that box is already MCP-connected — channel push covers it, the
+// hook-agent spawn would be redundant doubled delivery.
+export function hasLiveMcpFromWakeupHost(wakeup_url) {
+  if (!wakeup_url) return false
+  let host
+  try { host = new URL(wakeup_url).hostname } catch { return false }
+  for (const [, sess] of mcpSessions) {
+    if (!sess.remote) continue
+    // socket.remoteAddress may be IPv4-mapped IPv6 like ::ffff:192.168.1.231
+    const remote = sess.remote.replace(/^::ffff:/, '')
+    if (remote === host) return true
+  }
+  return false
 }
 
 function createMcpServer() {
@@ -675,6 +869,8 @@ function createMcpServer() {
       instructions: `Calling-all-stations is a multi-agent coordination server supporting MCP and A2A.
 
 When you receive a <channel source="calling-all-stations"> notification:
+- event="directive_sent": a directive was queued for an agent. If meta.to_session matches your session_id (or your persona), call check_inbox IMMEDIATELY, then act on the directive. Other agents ignore.
+- event="directive_status": a directive's lifecycle status changed (pending/delivered/read/accepted/completed/failed/rejected). The dispatcher (e.g. Wolf) uses this to track work without polling.
 - event="agent_status": log the update; the sending agent changed step.
 - event="agent_question": an agent needs an answer. Call send_directive with type="answer" immediately.
 - event="agent_response": an A2A task was completed by an agent. Mark the task done.
@@ -705,11 +901,61 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
         inputSchema: {
           type: 'object',
           properties: {
-            session_id: { type: 'string', description: 'Target agent session ID' },
-            type:       { type: 'string', enum: ['redirect', 'answer', 'abort', 'message'], description: 'Directive type' },
-            body:       { type: 'object', description: 'Directive payload' },
+            session_id:   { type: 'string', description: 'Target agent session ID' },
+            type:         { type: 'string', enum: ['redirect', 'answer', 'abort', 'message'], description: 'Directive type' },
+            body:         { type: 'object', description: 'Directive payload' },
+            from_session: { type: 'string', description: 'Optional: your own session ID, so you can later list what you dispatched via list_my_directives' },
           },
           required: ['session_id', 'type', 'body'],
+        },
+      },
+      {
+        name: 'peek_inbox',
+        description: 'Return pending directives for a session WITHOUT marking them delivered. Use to inspect an inbox non-destructively — unlike check_inbox, the real consumer still receives them.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            session_id: { type: 'string', description: 'Session ID whose inbox to peek' },
+          },
+          required: ['session_id'],
+        },
+      },
+      {
+        name: 'ack_directive',
+        description: 'Acknowledge a directive you received — report its progress back to the dispatcher. Emits a directive_status channel event. Call with status "read" when you see it, "accepted" when you start, and "completed"/"failed"/"rejected" when done.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            directive_id: { type: 'string', description: 'The directive id (from check_inbox/peek_inbox)' },
+            status:       { type: 'string', enum: ['read', 'accepted', 'completed', 'failed', 'rejected'], description: 'New status' },
+            note:         { type: 'string', description: 'Optional human-readable note' },
+            by:           { type: 'string', description: 'Optional: acknowledging session ID' },
+          },
+          required: ['directive_id', 'status'],
+        },
+      },
+      {
+        name: 'get_directive_status',
+        description: 'Look up the current status, delivery flag, and status history of a directive you dispatched.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            directive_id: { type: 'string', description: 'The directive id returned by send_directive' },
+          },
+          required: ['directive_id'],
+        },
+      },
+      {
+        name: 'list_my_directives',
+        description: 'List directives related to a session — by default those it dispatched (from_session), optionally filtered by status. Use to see in-flight dispatches and their delivery/ack state.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            session_id: { type: 'string', description: 'Your session ID (matched against from_session of dispatched directives)' },
+            status:     { type: 'string', enum: ['pending', 'delivered', 'read', 'accepted', 'completed', 'failed', 'rejected'], description: 'Optional status filter' },
+            inbound:    { type: 'boolean', description: 'If true, list directives addressed TO this session instead of dispatched BY it' },
+          },
+          required: ['session_id'],
         },
       },
       {
@@ -725,6 +971,7 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
             blocking:   { type: 'boolean', description: 'true for agent_question — signals you will poll check_inbox for an answer' },
             step:       { type: 'string', description: 'Current step label (updates your registry entry)' },
             task_id:    { type: 'string', description: 'Active task ID — if provided with agent_question+blocking, task moves to input_required state' },
+            persona:    { type: 'string', description: 'Tag your live MCP session with a persona (mike, smiley, gus, etc) so send_directive can route to you by name. Set this once on session start.' },
           },
           required: ['event', 'session_id'],
         },
@@ -777,22 +1024,39 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       const { session_id } = args
       autoRegister(session_id, 'MCP check_inbox')
       const pending = (inboxes.get(session_id) ?? []).filter(d => !d.delivered)
-      for (const d of pending) d.delivered = true
+      for (const d of pending) {
+        d.delivered = true
+        if (d.status === undefined || d.status === 'pending') d.status = 'delivered'
+        if (!d.delivered_at) d.delivered_at = new Date().toISOString()
+        indexDirective(session_id, d)  // ensure legacy/a2a directives are queryable
+      }
+      if (pending.length) persistState()  // delivered state must survive a restart
       process.stderr.write(`[calling-all-stations] check_inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
       return {
         content: [{ type: 'text', text: JSON.stringify({
-          directives: pending.map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at }))
+          directives: pending.map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at, status: d.status }))
         }) }]
       }
     }
 
     if (name === 'send_directive') {
-      const { session_id, type, body } = args
-      if (!registry.has(session_id))
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'session_not_found' }) }] }
-      const directive = { id: crypto.randomUUID(), type, body, sent_at: new Date().toISOString(), delivered: false }
+      const { session_id: requested, type, body, from_session } = args
+      const session_id = resolveTargetSession(requested)
+      if (!session_id || !registry.has(session_id))
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'session_not_found', requested }) }] }
+      if (session_id !== requested) {
+        counters.persona_routed = (counters.persona_routed || 0) + 1
+        dlog('INFO', 'route', `persona ${requested} → live session ${session_id.slice(0,8)}`)
+      }
+      const directive = {
+        id: crypto.randomUUID(), type, body,
+        sent_at: new Date().toISOString(), delivered: false,
+        status: 'pending', status_history: [],
+        to_session: session_id, from_session: from_session ?? null,
+      }
       if (!inboxes.has(session_id)) inboxes.set(session_id, [])
       inboxes.get(session_id).push(directive)
+      indexDirective(session_id, directive)
       const entry = registry.get(session_id)
       if (type === 'answer' && entry) {
         entry.waiting_for_answer = false
@@ -807,14 +1071,30 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
       }
       persistState()
       process.stderr.write(`[calling-all-stations] directive -> ${session_id.slice(0,8)}: ${type}\n`)
-      // Wake-up dispatch: if target is wakeup_only with a wakeup_url, POST the directive so
-      // the remote hook-agent fires immediately instead of waiting for a check_inbox poll
-      // that will never come. Fire-and-forget; client already has its directive_id.
-      // We coerce the directive body to a plain string before posting, because remote
-      // hook-agents (e.g. mike-hook-agent.js) do `${directive}` string interpolation —
-      // an unstringified object becomes "[object Object]". Prefer .message > .task >
-      // .instruction > JSON.stringify(whole body).
-      if (entry && entry.wakeup_url && entry.kind === 'wakeup_only') {
+      // Channel push so a persistent MCP-connected recipient gets a real-time
+      // signal to call check_inbox — without this they'd only see the directive
+      // on their next poll, which is how Smiley/Mike "went silent" in the first
+      // place. Broadcast scope is intentional (every session sees it); the meta
+      // includes to_session so each client can filter.
+      broadcastNotification('notifications/message', {
+        content: `<channel source="calling-all-stations">directive ${directive.id.slice(0, 8)} for ${session_id.slice(0, 8)} (${type})</channel>`,
+        meta: {
+          message_id: `m${Date.now()}-${++seq}`,
+          ts: new Date().toISOString(),
+          event: 'directive_sent',
+          directive_id: directive.id,
+          to_session: session_id,
+          from: from_session ?? null,
+          type,
+        },
+      })
+      // Wake-up dispatch: legacy escape hatch for personas whose persistent CLI is
+      // NOT MCP-connected. If there is already an active MCP session from the same
+      // remote host as the wakeup_url, the channel-push above is sufficient — firing
+      // wakeup-HTTP too causes doubled delivery (channel event + hook-agent spawn).
+      // This auto-retires the wakeup path the moment a persistent CLI is alive, without
+      // requiring the persona's startup script to drop the wakeup_url registration.
+      if (entry && entry.wakeup_url && entry.kind === 'wakeup_only' && !hasLiveMcpFromWakeupHost(entry.wakeup_url)) {
         counters.wakeups_attempted++; counters.directives_sent++
         dlog('DEBUG', 'wakeup-mcp', { target: session_id.slice(0,8), url: entry.wakeup_url, type })
         const directiveText = typeof body === 'string'
@@ -845,11 +1125,19 @@ Do not wait for the next scheduled tick — handle channel events immediately.`,
     }
 
     if (name === 'send') {
-      const { event: eventType, session_id, message, question, blocking, step, task_id } = args
+      const { event: eventType, session_id, message, question, blocking, step, task_id, persona } = args
       autoRegister(session_id, `MCP send(${eventType})`)
       const entry = registry.get(session_id)
       if (entry) {
         if (step) { entry.current_step = step; entry.last_status_at = new Date().toISOString() }
+        // Persona tagging — once set on a session, send_directive(persona) can route here.
+        // Idempotent: re-sending the same persona is a no-op.
+        if (persona && entry.persona !== persona) {
+          entry.persona = persona
+          entry.last_status_at = new Date().toISOString()
+          dlog('INFO', 'persona', `tagged session ${session_id.slice(0,8)} → persona=${persona}`)
+          persistState()
+        }
         if (eventType === 'agent_question' && blocking) {
           entry.waiting_for_answer = true
           entry.question    = question ?? null
@@ -965,6 +1253,66 @@ export function createAppServer() {
     if (req.url === '/mcp') {
       const sessionId = req.headers['mcp-session-id']
 
+      // Build a fresh MCP session bound to either a client-provided session_id
+      // (resurrecting an unknown one) or a freshly-generated UUID. Returns the
+      // transport ready to handleRequest. We adopt unknown ids so a client whose
+      // server-side session was lost (restart, eviction) "just works" on next
+      // call — no 404/reinit dance the SDK won't reliably perform.
+      const buildSession = (preferredId) => {
+        const idForGenerator = preferredId || crypto.randomUUID()
+        let mcpServer
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => idForGenerator,
+          onsessioninitialized: (sid) => {
+            // KEEPALIVE: per MCP spec utilities/ping — every 25s.
+            // Before the failStreak counter, clearInterval() stopped pinging
+            // but left the session in mcpSessions — every broadcast fanned to
+            // dead sockets and Smiley/Mike saw "channel went silent".
+            let failStreak = 0
+            const MAX_FAILS = 3   // ~75s unresponsive before eviction
+            const heartbeat = setInterval(async () => {
+              try {
+                await mcpServer.request({ method: 'ping' }, EmptyResultSchema)
+                counters.mcp_keepalives_sent = (counters.mcp_keepalives_sent || 0) + 1
+                failStreak = 0
+                const sess = mcpSessions.get(sid)
+                if (sess) sess.last_pong_at = new Date().toISOString()
+              } catch (e) {
+                counters.mcp_keepalives_failed = (counters.mcp_keepalives_failed || 0) + 1
+                failStreak++
+                dlog('WARN', 'mcp-ping', `session=${sid.slice(0,8)} fail=${failStreak}/${MAX_FAILS} err=${e.message}`)
+                if (failStreak >= MAX_FAILS) {
+                  clearInterval(heartbeat)
+                  counters.mcp_sessions_evicted = (counters.mcp_sessions_evicted || 0) + 1
+                  dlog('WARN', 'mcp', `evicting dead session ${sid.slice(0,8)} after ${failStreak} failed pings`)
+                  try { await transport.close() } catch (closeErr) {
+                    dlog('WARN', 'mcp', `transport.close err for ${sid.slice(0,8)}: ${closeErr.message}`)
+                    if (mcpSessions.has(sid)) {
+                      mcpSessions.delete(sid)
+                      dlog('INFO', 'mcp', `forced delete ${sid.slice(0,8)} (total=${mcpSessions.size})`)
+                    }
+                  }
+                }
+              }
+            }, 25_000)
+            mcpSessions.set(sid, { transport, server: mcpServer, heartbeat, connected_at: new Date().toISOString(), last_pong_at: null, remote: req.socket?.remoteAddress || null })
+            const reused = preferredId === sid ? ' (RESURRECTED stale id)' : ''
+            dlog('INFO', 'mcp', `session init ${sid.slice(0,8)} (total=${mcpSessions.size})${reused}`)
+          },
+        })
+        transport.onclose = () => {
+          const sid = transport.sessionId
+          if (sid) {
+            const sess = mcpSessions.get(sid)
+            if (sess?.heartbeat) clearInterval(sess.heartbeat)
+            mcpSessions.delete(sid)
+            dlog('INFO', 'mcp', `session closed ${sid.slice(0,8)} (total=${mcpSessions.size})`)
+          }
+        }
+        mcpServer = createMcpServer()
+        return { transport, ready: mcpServer.connect(transport) }
+      }
+
       if (req.method === 'POST') {
         let body = ''
         req.on('data', c => { body += c })
@@ -974,55 +1322,35 @@ export function createAppServer() {
 
         if (sessionId && mcpSessions.has(sessionId)) {
           await mcpSessions.get(sessionId).transport.handleRequest(req, res, parsedBody)
-        } else if (!sessionId) {
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => crypto.randomUUID(),
-            onsessioninitialized: (sid) => {
-              // KEEPALIVE: per MCP spec utilities/ping — server-initiated ping every 25s.
-              // Standard JSON-RPC request, client responds with empty result. Per spec:
-              // "Implementations SHOULD periodically issue pings to detect connection health"
-              // and "Multiple failed pings MAY trigger connection reset."
-              // Ref: https://modelcontextprotocol.info/specification/draft/basic/utilities/ping/
-              const heartbeat = setInterval(async () => {
-                try {
-                  await mcpServer.request({ method: 'ping' }, EmptyResultSchema)
-                  counters.mcp_keepalives_sent = (counters.mcp_keepalives_sent || 0) + 1
-                } catch (e) {
-                  counters.mcp_keepalives_failed = (counters.mcp_keepalives_failed || 0) + 1
-                  dlog('WARN', 'mcp-ping', `session=${sid.slice(0,8)} err=${e.message}`)
-                  // Spec-blessed: treat timeout / repeated failure as a dead connection
-                  clearInterval(heartbeat)
-                }
-              }, 25_000)
-              mcpSessions.set(sid, { transport, server: mcpServer, heartbeat })
-              dlog('INFO', 'mcp', `session init ${sid.slice(0,8)} (total=${mcpSessions.size}, keepalive=25s)`)
-            },
-          })
-          let mcpServer
-          transport.onclose = () => {
-            const sid = transport.sessionId
-            if (sid) {
-              const sess = mcpSessions.get(sid)
-              if (sess?.heartbeat) clearInterval(sess.heartbeat)
-              mcpSessions.delete(sid)
-              dlog('INFO', 'mcp', `session closed ${sid.slice(0,8)} (total=${mcpSessions.size})`)
-            }
-          }
-          mcpServer = createMcpServer()
-          await mcpServer.connect(transport)
-          await transport.handleRequest(req, res, parsedBody)
         } else {
-          res.writeHead(400, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Unknown session ID' }))
+          // No session_id OR unknown session_id: adopt the provided id (or
+          // mint a fresh one). For an unknown id the SDK client thinks its
+          // session is still alive — let it be right.
+          if (sessionId) {
+            counters.mcp_sessions_resurrected = (counters.mcp_sessions_resurrected || 0) + 1
+            dlog('INFO', 'mcp', `resurrecting stale POST session ${sessionId.slice(0,8)}`)
+          }
+          const { transport, ready } = buildSession(sessionId)
+          await ready
+          await transport.handleRequest(req, res, parsedBody)
         }
         return
       }
       if (req.method === 'GET') {
         if (sessionId && mcpSessions.has(sessionId)) {
           await mcpSessions.get(sessionId).transport.handleRequest(req, res)
+        } else if (sessionId) {
+          // Unknown GET session — adopt and start its notification stream.
+          counters.mcp_sessions_resurrected = (counters.mcp_sessions_resurrected || 0) + 1
+          dlog('INFO', 'mcp', `resurrecting stale GET session ${sessionId.slice(0,8)}`)
+          const { transport, ready } = buildSession(sessionId)
+          await ready
+          await transport.handleRequest(req, res)
         } else {
-          res.writeHead(400, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Invalid or missing session ID' }))
+          // GET with no session_id is genuinely invalid (notification stream
+          // needs an id to bind to). Keep this 404.
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Missing session ID' }))
         }
         return
       }
@@ -1220,8 +1548,17 @@ export function createAppServer() {
 
     // Health
     if (req.method === 'GET' && req.url === '/health') {
+      const connected_clients = []
+      for (const [sid, sess] of mcpSessions) {
+        connected_clients.push({
+          session_id: sid.slice(0, 8),
+          connected_at: sess.connected_at || null,
+          last_pong_at: sess.last_pong_at || null,
+          remote: sess.remote || null,
+        })
+      }
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ status: 'ok', port: PORT, agents: registry.size, mcp_sessions: mcpSessions.size, tasks: tasks.size }))
+      res.end(JSON.stringify({ status: 'ok', port: PORT, agents: registry.size, mcp_sessions: mcpSessions.size, tasks: tasks.size, connected_clients }))
       return
     }
 
@@ -1360,9 +1697,11 @@ export function createAppServer() {
           res.end(JSON.stringify({ error: 'missing session_id (or to/persona)' })); return
         }
         autoRegister(session_id, 'HTTP /check-inbox')
+        const peek = payload.peek === true || payload.peek === 'true'
         const pending = (inboxes.get(session_id) ?? []).filter(d => !d.delivered)
-        for (const d of pending) d.delivered = true
-        process.stderr.write(`[calling-all-stations] HTTP check-inbox ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
+        if (!peek) for (const d of pending) d.delivered = true
+        const verb = peek ? 'peek-inbox' : 'check-inbox'
+        process.stderr.write(`[calling-all-stations] HTTP ${verb} ${session_id.slice(0,8)}: ${pending.length} directive(s)\n`)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ directives: pending.map(d => ({ id: d.id, type: d.type, body: d.body, sent_at: d.sent_at })) }))
         return
@@ -1419,7 +1758,7 @@ export function createAppServer() {
       if (req.url === '/send-directive' || req.url === '/send_directive') {
         // Accept both the canonical {session_id, type, body} and the more natural
         // {to, type, text|message|body, from} shape that remote agents tend to guess.
-        let session_id = payload.session_id || payload.to
+        const requested = payload.session_id || payload.to
         const type = payload.type || 'message'
         let directiveBody = payload.body
         if (!directiveBody) {
@@ -1427,30 +1766,29 @@ export function createAppServer() {
             directiveBody = { from: payload.from || 'unknown', message: payload.text || payload.message }
           }
         }
-        if (!session_id || !directiveBody) {
+        if (!requested || !directiveBody) {
           res.writeHead(400, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: false, error: 'missing session_id (or to), and body (or text/message)' })); return
         }
-        // Persona resolution: if session_id isn't found, try <persona>-persistent, then
-        // look up by persona field. Remote agents tend to guess "wolf" / "mike" instead
-        // of the full session id, and we should route them rather than 404.
-        if (!registry.has(session_id)) {
-          const personaCandidate = `${session_id}-persistent`
-          if (registry.has(personaCandidate)) {
-            session_id = personaCandidate
-          } else {
-            for (const [sid, entry] of registry.entries()) {
-              if (entry.persona === session_id && entry.wakeup_url) { session_id = sid; break }
-            }
-          }
-        }
-        if (!registry.has(session_id)) {
+        // Persona routing — prefer live MCP session for the persona over placeholder.
+        let session_id = resolveTargetSession(requested)
+        if (!session_id || !registry.has(session_id)) {
           res.writeHead(404, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ ok: false, error: 'session_not_found' })); return
+          res.end(JSON.stringify({ ok: false, error: 'session_not_found', requested })); return
         }
-        const directive = { id: crypto.randomUUID(), type, body: directiveBody, sent_at: new Date().toISOString(), delivered: false }
+        if (session_id !== requested) {
+          counters.persona_routed = (counters.persona_routed || 0) + 1
+          dlog('INFO', 'route', `HTTP persona ${requested} → live session ${session_id.slice(0,8)}`)
+        }
+        const directive = {
+          id: crypto.randomUUID(), type, body: directiveBody,
+          sent_at: new Date().toISOString(), delivered: false,
+          status: 'pending', status_history: [],
+          to_session: session_id, from_session: payload.from || payload.from_session || null,
+        }
         if (!inboxes.has(session_id)) inboxes.set(session_id, [])
         inboxes.get(session_id).push(directive)
+        indexDirective(session_id, directive)
         const entry = registry.get(session_id)
         if (type === 'answer' && entry) {
           entry.waiting_for_answer = false
@@ -1465,8 +1803,23 @@ export function createAppServer() {
         }
         persistState()
         process.stderr.write(`[calling-all-stations] HTTP send-directive -> ${session_id.slice(0,8)}: ${type}\n`)
-        // Wake-up dispatch (same as MCP send_directive path)
-        if (entry && entry.wakeup_url && entry.kind === 'wakeup_only') {
+        // Parity with MCP send_directive: push a channel event so an MCP-connected
+        // recipient gets the real-time signal to check_inbox.
+        broadcastNotification('notifications/message', {
+          content: `<channel source="calling-all-stations">directive ${directive.id.slice(0, 8)} for ${session_id.slice(0, 8)} (${type})</channel>`,
+          meta: {
+            message_id: `m${Date.now()}-${++seq}`,
+            ts: new Date().toISOString(),
+            event: 'directive_sent',
+            directive_id: directive.id,
+            to_session: session_id,
+            from: directive.from_session,
+            type,
+          },
+        })
+        // Wake-up dispatch (same as MCP send_directive path) — skip when a live
+        // MCP session already exists from the wakeup_url host (channel-push covers it).
+        if (entry && entry.wakeup_url && entry.kind === 'wakeup_only' && !hasLiveMcpFromWakeupHost(entry.wakeup_url)) {
           const directiveText = typeof directiveBody === 'string'
             ? directiveBody
             : (directiveBody && (directiveBody.message || directiveBody.task || directiveBody.instruction)) || JSON.stringify(directiveBody)
@@ -1498,12 +1851,20 @@ export function createAppServer() {
         return
       }
 
-      if (req.url === '/status') {
-        const { session_id, step } = payload
-        if (session_id && registry.has(session_id)) {
+      if (req.url === '/status' || req.url === '/agent_status') {
+        const { session_id, step, persona } = payload
+        if (session_id) {
+          autoRegister(session_id, 'HTTP /status')
           const entry = registry.get(session_id)
-          entry.current_step = step
-          entry.last_status_at = new Date().toISOString()
+          if (entry) {
+            if (step) { entry.current_step = step }
+            if (persona && entry.persona !== persona) {
+              entry.persona = persona
+              dlog('INFO', 'persona', `HTTP tagged session ${session_id.slice(0,8)} → persona=${persona}`)
+            }
+            entry.last_status_at = new Date().toISOString()
+            persistState()
+          }
         }
         res.writeHead(204); res.end(); return
       }

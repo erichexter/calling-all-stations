@@ -67,6 +67,17 @@ describe('GET /health', () => {
     assert.equal(typeof json.agents, 'number')
     assert.equal(typeof json.tasks, 'number')
   })
+
+  test('includes connected_clients array (per #251 acceptance)', async () => {
+    const { json } = await get(`${base}/health`)
+    assert.ok(Array.isArray(json.connected_clients), 'connected_clients must be an array')
+    // Each entry has the shape Wolf needs to spot dead persona clients.
+    for (const c of json.connected_clients) {
+      assert.equal(typeof c.session_id, 'string')
+      assert.ok('connected_at' in c)
+      assert.ok('last_pong_at' in c)
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -780,6 +791,36 @@ describe('Existing REST endpoints still work', () => {
     const inbox = await post(`${base}/check-inbox`, { session_id: 'rest-1' })
     assert.equal(inbox.json.directives.length, 1)
     assert.equal(inbox.json.directives[0].body.text, 'hello')
+  })
+
+  test('REST /check-inbox with peek=true does NOT mark directives delivered', async () => {
+    await post(`${base}/register`, { session_id: 'peek-1', label: 'PeekAgent' })
+    await post(`${base}/send-directive`, { session_id: 'peek-1', type: 'message', body: { text: 'do not consume me' } })
+    const peeked = await post(`${base}/check-inbox`, { session_id: 'peek-1', peek: true })
+    assert.equal(peeked.json.directives.length, 1)
+    // Peek must not flip delivered. Calling again should still return the same item.
+    const peekedAgain = await post(`${base}/check-inbox`, { session_id: 'peek-1', peek: true })
+    assert.equal(peekedAgain.json.directives.length, 1, 'peek must be idempotent')
+    // A real check-inbox (no peek) consumes.
+    const consumed = await post(`${base}/check-inbox`, { session_id: 'peek-1' })
+    assert.equal(consumed.json.directives.length, 1)
+    const afterConsume = await post(`${base}/check-inbox`, { session_id: 'peek-1', peek: true })
+    assert.equal(afterConsume.json.directives.length, 0, 'real check-inbox marks delivered')
+  })
+
+  test('REST /send-directive populates directiveIndex (so get_directive_status finds it)', async () => {
+    const { directiveIndex } = await import('../server.js')
+    directiveIndex.clear()
+    await post(`${base}/register`, { session_id: 'rest-idx', label: 'IndexAgent' })
+    const { json } = await post(`${base}/send-directive`, {
+      session_id: 'rest-idx', type: 'message', body: { text: 'index me' }, from: 'wolf',
+    })
+    assert.ok(json.directive_id, 'directive_id returned')
+    const stored = directiveIndex.get(json.directive_id)
+    assert.ok(stored, 'directive must be in the index — wolf can query its lifecycle')
+    assert.equal(stored.to_session, 'rest-idx')
+    assert.equal(stored.from_session, 'wolf')
+    assert.equal(stored.status, 'pending')
   })
 
   test('DELETE /deregister/:id removes agent', async () => {
